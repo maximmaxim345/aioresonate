@@ -46,10 +46,15 @@ class AlbumCoverWidget(Static):
 
     async def update_album_art(self, album_art: AlbumArt | None) -> None:
         """Update the displayed album art."""
-        placeholder = self.query_one("#album-placeholder", Label)
+        try:
+            placeholder = self.query_one("#album-placeholder", Label)
+        except (LookupError, RuntimeError):
+            # Widget not ready yet
+            return
 
         if album_art is None:
             placeholder.display = True
+            placeholder.update(self._placeholder_text)
             if self._image_widget is not None:
                 self._image_widget.display = False
             return
@@ -72,8 +77,10 @@ class AlbumCoverWidget(Static):
             self._image_widget.display = True
 
         except (OSError, ValueError) as e:
-            placeholder.update(f"Error loading image: {e}")
+            placeholder.update(f"Error: {e}")
             placeholder.display = True
+            if self._image_widget is not None:
+                self._image_widget.display = False
 
 
 class SongProgressWidget(Static):
@@ -256,7 +263,7 @@ class ResonateTUI(App[None]):
         super().__init__(*args, **kwargs)
         self._client = client
         self._state = state
-        self._album_art: AlbumArt | None = None
+        self._last_album_art: AlbumArt | None = None
         self._update_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
@@ -316,41 +323,45 @@ class ResonateTUI(App[None]):
 
     async def update_ui(self) -> None:
         """Update all UI elements based on current state."""
-        # Update metadata
-        title_label = self.query_one("#song-title", Label)
-        title_label.update(f"Title: {self._state.title or 'Unknown'}")
+        try:
+            # Update metadata
+            title_label = self.query_one("#song-title", Label)
+            title_label.update(f"Title: {self._state.title or 'Unknown'}")
 
-        artist_label = self.query_one("#song-artist", Label)
-        artist_label.update(f"Artist: {self._state.artist or 'Unknown'}")
+            artist_label = self.query_one("#song-artist", Label)
+            artist_label.update(f"Artist: {self._state.artist or 'Unknown'}")
 
-        album_label = self.query_one("#song-album", Label)
-        album_label.update(f"Album: {self._state.album or 'Unknown'}")
+            album_label = self.query_one("#song-album", Label)
+            album_label.update(f"Album: {self._state.album or 'Unknown'}")
 
-        # Update progress
-        progress_widget = self.query_one("#song-progress", SongProgressWidget)
-        progress_widget.update_progress(self._state.track_progress, self._state.track_duration)
+            # Update progress
+            progress_widget = self.query_one("#song-progress", SongProgressWidget)
+            progress_widget.update_progress(self._state.track_progress, self._state.track_duration)
 
-        # Update volume
-        volume_label = self.query_one("#volume-status", Label)
-        mute_str = " (muted)" if self._state.muted else ""
-        volume = self._state.volume if self._state.volume is not None else 0
-        volume_label.update(f"Volume: {volume}%{mute_str}")
+            # Update volume
+            volume_label = self.query_one("#volume-status", Label)
+            mute_str = " (muted)" if self._state.muted else ""
+            volume = self._state.volume if self._state.volume is not None else 0
+            volume_label.update(f"Volume: {volume}%{mute_str}")
 
-        # Update playback state
-        state_label = self.query_one("#playback-state", Label)
-        state = self._state.playback_state.value if self._state.playback_state else "unknown"
-        state_label.update(f"State: {state}")
+            # Update playback state
+            state_label = self.query_one("#playback-state", Label)
+            state = self._state.playback_state.value if self._state.playback_state else "unknown"
+            state_label.update(f"State: {state}")
 
-        # Update play/pause button
-        controls = self.query_one("#controls", ControlButtonsWidget)
-        is_playing = self._state.playback_state == PlaybackStateType.PLAYING
-        controls.update_play_pause_button(is_playing)
+            # Update play/pause button
+            controls = self.query_one("#controls", ControlButtonsWidget)
+            is_playing = self._state.playback_state == PlaybackStateType.PLAYING
+            controls.update_play_pause_button(is_playing)
 
-    async def set_album_art(self, album_art: AlbumArt | None) -> None:
-        """Set the album art to display."""
-        self._album_art = album_art
-        album_cover = self.query_one("#album-cover", AlbumCoverWidget)
-        await album_cover.update_album_art(album_art)
+            # Update album art if changed
+            if self._state.album_art != self._last_album_art:
+                self._last_album_art = self._state.album_art
+                album_cover = self.query_one("#album-cover", AlbumCoverWidget)
+                await album_cover.update_album_art(self._state.album_art)
+        except (LookupError, RuntimeError):
+            # Widgets not ready yet during initialization
+            pass
 
     # Button handlers
     # Note: Fire-and-forget tasks are intentional for UI handlers (RUF006)

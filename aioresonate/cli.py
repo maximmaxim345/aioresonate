@@ -602,8 +602,8 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
         tui_app = ResonateTUI(client=client, state=state)
 
         # Set up callbacks
-        client.set_metadata_listener(lambda payload: _handle_session_update(state, payload))
-        client.set_group_update_listener(lambda payload: _handle_group_update(state, payload))
+        client.set_metadata_listener(partial(_handle_session_update, state, use_tui=True))
+        client.set_group_update_listener(partial(_handle_group_update, state, use_tui=True))
 
         # Wrap audio stream start to also track metadata
         async def on_stream_start_wrapper(message: StreamStartMessage) -> None:
@@ -613,7 +613,7 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
         client.set_stream_start_listener(on_stream_start_wrapper)
         client.set_stream_end_listener(audio_handler.on_stream_end)
         client.set_audio_chunk_listener(audio_handler.on_audio_chunk)
-        client.set_media_art_listener(lambda ts, data: _handle_media_art(state, tui_app, ts, data))
+        client.set_media_art_listener(partial(_handle_media_art, state))
 
         # Audio player will be created when first audio chunk arrives
 
@@ -658,16 +658,21 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
     return 0
 
 
-async def _handle_session_update(state: CLIState, payload: SessionUpdatePayload) -> None:
+async def _handle_session_update(
+    state: CLIState, payload: SessionUpdatePayload, *, use_tui: bool = False
+) -> None:
     if payload.playback_state is not None and payload.playback_state != state.playback_state:
         state.playback_state = payload.playback_state
-        _print_event(f"Playback state: {payload.playback_state.value}")
+        if not use_tui:
+            _print_event(f"Playback state: {payload.playback_state.value}")
 
-    if payload.metadata is not None and state.update_metadata(payload.metadata):
+    if payload.metadata is not None and state.update_metadata(payload.metadata) and not use_tui:
         _print_event(state.describe())
 
 
-async def _handle_group_update(state: CLIState, payload: GroupUpdateServerPayload) -> None:
+async def _handle_group_update(
+    state: CLIState, payload: GroupUpdateServerPayload, *, use_tui: bool = False
+) -> None:
     supported: set[MediaCommand] = set()
     for command in payload.supported_commands:
         try:
@@ -678,10 +683,12 @@ async def _handle_group_update(state: CLIState, payload: GroupUpdateServerPayloa
 
     if payload.volume != state.volume:
         state.volume = payload.volume
-        _print_event(f"Volume: {payload.volume}%")
+        if not use_tui:
+            _print_event(f"Volume: {payload.volume}%")
     if payload.muted != state.muted:
         state.muted = payload.muted
-        _print_event("Muted" if payload.muted else "Unmuted")
+        if not use_tui:
+            _print_event("Muted" if payload.muted else "Unmuted")
 
 
 async def _handle_stream_start_metadata(state: CLIState, message: StreamStartMessage) -> None:
@@ -690,14 +697,11 @@ async def _handle_stream_start_metadata(state: CLIState, message: StreamStartMes
         state.album_art_format = message.payload.metadata.art_format.value
 
 
-async def _handle_media_art(
-    state: CLIState, tui: ResonateTUI | None, _timestamp_us: int, image_data: bytes
-) -> None:
-    """Handle incoming media art."""
+def _handle_media_art(state: CLIState, _timestamp_us: int, image_data: bytes) -> None:
+    """Handle incoming media art (sync wrapper for callback)."""
     if state.album_art_format is not None:
         state.album_art = AlbumArt(image_data=image_data, format=state.album_art_format)
-        if tui is not None:
-            await tui.set_album_art(state.album_art)
+        # TUI will pick up the change in its periodic update loop
 
 
 class CommandHandler:
