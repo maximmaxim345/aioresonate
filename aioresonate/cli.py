@@ -468,15 +468,19 @@ async def _connection_loop(
 class AudioStreamHandler:
     """Manages audio playback state and stream lifecycle."""
 
-    def __init__(self, client: ResonateClient, audio_device: int | None = None) -> None:
+    def __init__(
+        self, client: ResonateClient, audio_device: int | None = None, *, use_tui: bool = False
+    ) -> None:
         """Initialize the audio stream handler.
 
         Args:
             client: The Resonate client instance.
             audio_device: Audio device ID to use. None for default device.
+            use_tui: Whether TUI mode is active (suppresses print statements).
         """
         self._client = client
         self._audio_device = audio_device
+        self._use_tui = use_tui
         self.audio_player: AudioPlayer | None = None
         self._current_format: PCMFormat | None = None
 
@@ -503,14 +507,16 @@ class AudioStreamHandler:
         if self.audio_player is not None:
             self.audio_player.clear()
             logger.debug("Cleared audio queue on stream start")
-        _print_event("Stream started")
+        if not self._use_tui:
+            _print_event("Stream started")
 
     def on_stream_end(self) -> None:
         """Handle stream end by clearing audio queue to prevent desync on resume."""
         if self.audio_player is not None:
             self.audio_player.clear()
             logger.debug("Cleared audio queue on stream end")
-        _print_event("Stream ended")
+        if not self._use_tui:
+            _print_event("Stream ended")
 
     def clear_queue(self) -> None:
         """Clear the audio queue to prevent desync."""
@@ -596,7 +602,7 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
                 return 1
 
         # Create audio and stream handlers
-        audio_handler = AudioStreamHandler(client, audio_device=audio_device)
+        audio_handler = AudioStreamHandler(client, audio_device=audio_device, use_tui=True)
 
         # Create TUI app
         tui_app = ResonateTUI(client=client, state=state)
