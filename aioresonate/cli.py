@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import socket
@@ -22,6 +23,7 @@ from aiohttp import ClientError
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 
 from aioresonate.cli_audio import AudioPlayer
+from aioresonate.cli_tui import AlbumArt, ResonateTUI
 from aioresonate.client import PCMFormat, ResonateClient
 from aioresonate.models.controller import GroupUpdateServerPayload
 from aioresonate.models.core import SessionUpdatePayload, StreamStartMessage
@@ -49,6 +51,8 @@ class CLIState:
     album: str | None = None
     track_progress: int | None = None
     track_duration: int | None = None
+    album_art: AlbumArt | None = None
+    album_art_format: str | None = None
 
     def update_metadata(self, metadata: SessionUpdateMetadata) -> bool:
         """Merge new metadata into the state and report if anything changed."""
@@ -554,9 +558,9 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
             buffer_capacity=32_000_000,
         ),
         metadata_support=ClientHelloMetadataSupport(
-            support_picture_formats=[],
-            media_width=None,
-            media_height=None,
+            support_picture_formats=["bmp", "jpeg", "png"],
+            media_width=800,
+            media_height=800,
         ),
         static_delay_ms=args.static_delay_ms,
     )
@@ -594,33 +598,53 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
         # Create audio and stream handlers
         audio_handler = AudioStreamHandler(client, audio_device=audio_device)
 
+        # Create TUI app
+        tui_app = ResonateTUI(client=client, state=state)
+
+        # Set up callbacks
         client.set_metadata_listener(lambda payload: _handle_session_update(state, payload))
         client.set_group_update_listener(lambda payload: _handle_group_update(state, payload))
-        client.set_stream_start_listener(audio_handler.on_stream_start)
+
+        # Wrap audio stream start to also track metadata
+        async def on_stream_start_wrapper(message: StreamStartMessage) -> None:
+            await audio_handler.on_stream_start(message)
+            await _handle_stream_start_metadata(state, message)
+
+        client.set_stream_start_listener(on_stream_start_wrapper)
         client.set_stream_end_listener(audio_handler.on_stream_end)
         client.set_audio_chunk_listener(audio_handler.on_audio_chunk)
+        client.set_media_art_listener(lambda ts, data: _handle_media_art(state, tui_app, ts, data))
 
         # Audio player will be created when first audio chunk arrives
 
-        _print_instructions()
-
-        # Create and start keyboard task
-        keyboard_task = asyncio.create_task(_keyboard_loop(client, state, audio_handler))
+        # Create TUI task
+        tui_task = asyncio.create_task(tui_app.run_async())
 
         # Set up signal handler for graceful shutdown on Ctrl+C
         loop = asyncio.get_running_loop()
 
         def signal_handler() -> None:
             logger.debug("Received interrupt signal, shutting down...")
-            keyboard_task.cancel()
+            tui_task.cancel()
 
         loop.add_signal_handler(signal.SIGINT, signal_handler)
 
         try:
-            # Run connection loop with auto-reconnect
-            await _connection_loop(client, discovery, audio_handler, url, keyboard_task)
+            # Run connection loop with auto-reconnect alongside TUI
+            connection_task = asyncio.create_task(
+                _connection_loop(client, discovery, audio_handler, url, tui_task)
+            )
+            # Wait for TUI to exit (user quit) or connection to fail
+            _, pending = await asyncio.wait(
+                [tui_task, connection_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            # Cancel any remaining tasks
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         except asyncio.CancelledError:
-            logger.debug("Connection loop cancelled")
+            logger.debug("Main task cancelled")
         finally:
             # Remove signal handler
             loop.remove_signal_handler(signal.SIGINT)
@@ -658,6 +682,22 @@ async def _handle_group_update(state: CLIState, payload: GroupUpdateServerPayloa
     if payload.muted != state.muted:
         state.muted = payload.muted
         _print_event("Muted" if payload.muted else "Unmuted")
+
+
+async def _handle_stream_start_metadata(state: CLIState, message: StreamStartMessage) -> None:
+    """Handle stream start to track album art format."""
+    if message.payload.metadata is not None and message.payload.metadata.art_format is not None:
+        state.album_art_format = message.payload.metadata.art_format.value
+
+
+async def _handle_media_art(
+    state: CLIState, tui: ResonateTUI | None, _timestamp_us: int, image_data: bytes
+) -> None:
+    """Handle incoming media art."""
+    if state.album_art_format is not None:
+        state.album_art = AlbumArt(image_data=image_data, format=state.album_art_format)
+        if tui is not None:
+            await tui.set_album_art(state.album_art)
 
 
 class CommandHandler:

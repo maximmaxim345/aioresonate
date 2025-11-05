@@ -32,6 +32,8 @@ version = "0.0.0"
 cli = [
   "aioconsole>=0.8.0",
   "sounddevice>=0.4.6",
+  "textual>=1.0.0",
+  "textual-image>=0.3.0",
 ]
 test = [
   "codespell==2.4.1",

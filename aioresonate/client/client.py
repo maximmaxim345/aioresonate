@@ -87,6 +87,9 @@ StreamEndCallback = Callable[[], Awaitable[None] | None]
 # Callback invoked with (server_timestamp_us, audio_data, format) when audio chunks arrive.
 AudioChunkCallback = Callable[[int, bytes, PCMFormat], Awaitable[None] | None]
 
+# Callback invoked with (timestamp_us, image_data) when media art is received.
+MediaArtCallback = Callable[[int, bytes], Awaitable[None] | None]
+
 # Callback invoked when the client disconnects from the server.
 DisconnectCallback = Callable[[], Awaitable[None] | None]
 
@@ -167,6 +170,8 @@ class ResonateClient:
     """Callback invoked when a stream ends."""
     _audio_chunk_callback: AudioChunkCallback | None = None
     """Callback invoked when audio chunks are received."""
+    _media_art_callback: MediaArtCallback | None = None
+    """Callback invoked when media art is received."""
     _disconnect_callback: DisconnectCallback | None = None
     """Callback invoked when the client disconnects."""
 
@@ -373,6 +378,16 @@ class ResonateClient:
         """
         self._audio_chunk_callback = callback
 
+    def set_media_art_listener(self, callback: MediaArtCallback | None) -> None:
+        """
+        Set or clear (if None) the callback invoked when media art is received.
+
+        The callback receives:
+        - timestamp_us: Server timestamp when this media art was sent
+        - image_data: Raw image bytes in the format specified in stream metadata
+        """
+        self._media_art_callback = callback
+
     def set_disconnect_listener(self, callback: DisconnectCallback | None) -> None:
         """Set or clear (if None) the callback invoked when the client disconnects."""
         self._disconnect_callback = callback
@@ -474,6 +489,8 @@ class ResonateClient:
 
         if message_type is BinaryMessageType.AUDIO_CHUNK:
             await self._handle_audio_chunk(header.timestamp_us, payload[BINARY_HEADER_SIZE:])
+        elif message_type is BinaryMessageType.MEDIA_ART:
+            await self._handle_media_art(header.timestamp_us, payload[BINARY_HEADER_SIZE:])
         else:
             logger.debug("Ignoring unsupported binary message type: %s", message_type)
 
@@ -591,6 +608,18 @@ class ResonateClient:
                 await result
         except Exception:
             logger.exception("Error in audio chunk callback %s", self._audio_chunk_callback)
+
+    async def _handle_media_art(self, timestamp_us: int, payload: bytes) -> None:
+        """Handle incoming media art and notify callback."""
+        if self._media_art_callback is None:
+            return
+
+        try:
+            result = self._media_art_callback(timestamp_us, payload)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.exception("Error in media art callback %s", self._media_art_callback)
 
     def compute_play_time(self, server_timestamp_us: int) -> int:
         """
