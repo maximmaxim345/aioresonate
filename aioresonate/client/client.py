@@ -257,6 +257,16 @@ class ResonateClient:
         self._static_delay_us = delay_us
         logger.info("Set static playback delay to %.1f ms", self.static_delay_ms)
 
+    @property
+    def sync_offset_us(self) -> float:
+        """Return the current time synchronization offset in microseconds."""
+        return self._time_filter.offset
+
+    @property
+    def sync_error_us(self) -> int:
+        """Return the current time synchronization error estimate in microseconds."""
+        return self._time_filter.error
+
     async def connect(self, url: str) -> None:
         """Connect to a Resonate server via WebSocket."""
         if self.connected:

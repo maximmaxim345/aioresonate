@@ -1,4 +1,4 @@
-"""Enhanced Textual-based TUI for the Resonate CLI client."""
+"""Enhanced responsive Textual-based TUI for the Resonate CLI client."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from io import BytesIO
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from PIL import Image
 from textual import on
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
 from aioresonate.models.types import MediaCommand, PlaybackStateType
 
 logger = logging.getLogger(__name__)
+
+
+class LayoutMode(Enum):
+    """Responsive layout modes based on terminal width."""
+
+    TINY = "tiny"  # < 60: Minimal essentials
+    COMPACT = "compact"  # 60-80: Basic info
+    STANDARD = "standard"  # 80-120: Normal with small album
+    FULL = "full"  # > 120: All features
 
 
 @dataclass
@@ -108,6 +118,12 @@ class HelpScreen(ModalScreen[None]):
                 yield Label("  +/-        - Volume up/down (5%)", classes="help-row")
                 yield Label("  m          - Toggle mute", classes="help-row")
 
+                yield Label("Delay Adjustment", classes="help-heading help-section")
+                yield Label("  [          - Decrease delay -10ms", classes="help-row")
+                yield Label("  ]          - Increase delay +10ms", classes="help-row")
+                yield Label("  {          - Decrease delay -50ms", classes="help-row")
+                yield Label("  }          - Increase delay +50ms", classes="help-row")
+
                 yield Label("Interface", classes="help-heading help-section")
                 yield Label("  ?          - Show this help", classes="help-row")
                 yield Label("  q          - Quit", classes="help-row")
@@ -158,10 +174,111 @@ class ConnectionStatus(Static):
             return "◌ Connecting..."
         return "○ Disconnected"
 
-    def watch_status(self, new_status: str) -> None:
+    def watch_status(self, _new_status: str) -> None:
         """Update CSS class when status changes."""
         self.remove_class("status-connected", "status-connecting", "status-disconnected")
-        self.add_class(f"status-{new_status}")
+        self.add_class(f"status-{self.status}")
+
+
+class SyncInfoWidget(Static):
+    """Widget displaying time sync information."""
+
+    is_synchronized = reactive(False)  # noqa: FBT003
+    offset_us = reactive(0.0)
+    error_us = reactive(0)
+    static_delay_ms = reactive(0.0)
+
+    DEFAULT_CSS = """
+    SyncInfoWidget {
+        height: auto;
+        width: 100%;
+        border: solid $primary;
+        padding: 0 1;
+    }
+
+    .sync-good {
+        color: $success;
+    }
+
+    .sync-syncing {
+        color: $warning;
+    }
+    """
+
+    def render(self) -> str:
+        """Render sync information."""
+        if not self.is_synchronized:
+            return "⏱ Syncing..."
+
+        offset_ms = self.offset_us / 1000.0
+        error_ms = self.error_us / 1000.0
+
+        return (
+            f"✓ Synced | Offset: {offset_ms:+.1f}ms "
+            f"| Error: ±{error_ms:.1f}ms | Delay: {self.static_delay_ms:+.0f}ms"
+        )
+
+    def watch_is_synchronized(self, _new_sync: bool) -> None:  # noqa: FBT001
+        """Update CSS when sync state changes."""
+        self.remove_class("sync-good", "sync-syncing")
+        if self.is_synchronized:
+            self.add_class("sync-good")
+        else:
+            self.add_class("sync-syncing")
+
+
+class CompactSyncInfo(Static):
+    """Compact sync info for smaller screens."""
+
+    is_synchronized = reactive(False)  # noqa: FBT003
+    static_delay_ms = reactive(0.0)
+
+    def render(self) -> str:
+        """Render compact sync info."""
+        sync_icon = "✓" if self.is_synchronized else "⏱"
+        return f"{sync_icon} Delay: {self.static_delay_ms:+.0f}ms"
+
+
+class DelayControlsWidget(Static):
+    """Widget with delay adjustment buttons."""
+
+    def __init__(self, on_adjust: Any, *args: Any, **kwargs: Any) -> None:
+        """Initialize delay controls."""
+        super().__init__(*args, **kwargs)
+        self._on_adjust = on_adjust
+
+    def compose(self) -> ComposeResult:
+        """Compose delay control buttons."""
+        with Horizontal(id="delay-buttons"):
+            yield Button("-50ms [{", id="btn-delay-minus-50", variant="error")
+            yield Button("-10ms [", id="btn-delay-minus-10", variant="warning")
+            yield Label("Adjust Delay", id="delay-label")
+            yield Button("+10ms ]", id="btn-delay-plus-10", variant="warning")
+            yield Button("+50ms ]}", id="btn-delay-plus-50", variant="success")
+
+    @on(Button.Pressed, "#btn-delay-minus-50")
+    def on_delay_minus_50(self) -> None:
+        """Decrease delay by 50ms."""
+        if callable(self._on_adjust):
+            self._on_adjust(-50)
+
+    @on(Button.Pressed, "#btn-delay-minus-10")
+    def on_delay_minus_10(self) -> None:
+        """Decrease delay by 10ms."""
+        if callable(self._on_adjust):
+            self._on_adjust(-10)
+
+    @on(Button.Pressed, "#btn-delay-plus-10")
+    def on_delay_plus_10(self) -> None:
+        """Increase delay by 10ms."""
+        if callable(self._on_adjust):
+            self._on_adjust(10)
+
+    @on(Button.Pressed, "#btn-delay-plus-50")
+    def on_delay_plus_50(self) -> None:
+        """Increase delay by 50ms."""
+        if callable(self._on_adjust):
+            self._on_adjust(50)
 
 
 class VolumeSlider(Static):
@@ -217,7 +334,6 @@ class VolumeSlider(Static):
             label.update(f"Volume: {self.volume}%{mute_str}")
 
             fill = self.query_one("#volume-bar-fill", Static)
-            # Calculate width as percentage
             bar_width = max(0, min(100, self.volume))
             fill.styles.width = f"{bar_width}%"
         except (LookupError, RuntimeError):
@@ -230,10 +346,10 @@ class AlbumCoverWidget(Static):
 
     is_loading = reactive(False)  # noqa: FBT003
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the album cover widget."""
         super().__init__(*args, **kwargs)
-        self._image_widget: TextualImage | None = None
+        self._image_widget: TextualImage | None = None  # type: ignore[valid-type]
         self._loading_widget: LoadingIndicator | None = None
         self._placeholder_text = "No Album Art"
 
@@ -246,19 +362,17 @@ class AlbumCoverWidget(Static):
         try:
             placeholder = self.query_one("#album-placeholder", Label)
         except (LookupError, RuntimeError):
-            # Widget not ready yet
             return
 
         if album_art is None:
             placeholder.display = True
             placeholder.update(self._placeholder_text)
             if self._image_widget is not None:
-                self._image_widget.display = False
+                self._image_widget.display = False  # type: ignore[unreachable]
             if self._loading_widget is not None:
                 self._loading_widget.display = False
             return
 
-        # Show loading indicator
         self.is_loading = True
         try:
             if self._loading_widget is None:
@@ -269,7 +383,6 @@ class AlbumCoverWidget(Static):
             pass
 
         try:
-            # Load image using PIL
             image = Image.open(BytesIO(album_art.image_data))
 
             logger.debug(
@@ -280,16 +393,13 @@ class AlbumCoverWidget(Static):
                 len(album_art.image_data),
             )
 
-            # Remove old image widget if it exists
             if self._image_widget is not None:
-                await self._image_widget.remove()
+                await self._image_widget.remove()  # type: ignore[unreachable]
                 self._image_widget = None
 
-            # Create new image widget with the PIL image
             self._image_widget = TextualImage(image)
             await self.mount(self._image_widget)
 
-            # Hide placeholder and loading
             placeholder.display = False
             if self._loading_widget is not None:
                 self._loading_widget.display = False
@@ -297,22 +407,14 @@ class AlbumCoverWidget(Static):
 
             logger.info("Album art loaded successfully")
 
-        except (OSError, ValueError, ImportError) as e:
-            # Show user-friendly error
+        except (OSError, ValueError, ImportError):
             logger.exception("Failed to load album art")
 
-            # Determine user-friendly message
-            if isinstance(e, FileNotFoundError):
-                error_msg = "Album art not available"
-            elif isinstance(e, ImportError):
-                error_msg = "Image library not available"
-            else:
-                error_msg = "Could not display album art"
-
+            error_msg = "Album art unavailable"
             placeholder.update(error_msg)
             placeholder.display = True
             if self._image_widget is not None:
-                self._image_widget.display = False
+                self._image_widget.display = False  # type: ignore[unreachable]
             if self._loading_widget is not None:
                 self._loading_widget.display = False
 
@@ -326,7 +428,7 @@ class SongProgressWidget(Static):
     progress = reactive(0)
     duration = reactive(0)
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize the song progress widget."""
         super().__init__(*args, **kwargs)
 
@@ -353,12 +455,10 @@ class SongProgressWidget(Static):
                 time_label.update("0:00 / 0:00")
                 return
 
-            # Update progress bar (percentage)
             progress_pct = (self.progress / self.duration) * 100 if self.duration > 0 else 0
             progress_bar = self.query_one("#progress-bar", ProgressBar)
             progress_bar.update(progress=progress_pct)
 
-            # Update time label
             progress_str = self._format_time(self.progress)
             duration_str = self._format_time(self.duration)
             time_label = self.query_one("#progress-time", Label)
@@ -378,12 +478,12 @@ class ControlButtonsWidget(Static):
 
     def __init__(
         self,
-        on_previous: object,
-        on_play_pause: object,
-        on_stop: object,
-        on_next: object,
-        *args: object,
-        **kwargs: object,
+        on_previous: Any,
+        on_play_pause: Any,
+        on_stop: Any,
+        on_next: Any,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
         """Initialize control buttons."""
         super().__init__(*args, **kwargs)
@@ -437,19 +537,55 @@ class ControlButtonsWidget(Static):
 
 
 class ResonateTUI(App[None]):
-    """Enhanced Textual UI for Resonate CLI client."""
+    """Enhanced responsive Textual UI for Resonate CLI client."""
 
     CSS = """
     Screen {
         background: $surface;
     }
 
+    /* Main container */
     #main-container {
         height: 1fr;
         width: 100%;
-        layout: vertical;
     }
 
+    /* Tiny mode styles */
+    .layout-tiny #album-cover-container,
+    .layout-tiny #sync-info-full,
+    .layout-tiny #volume-container,
+    .layout-tiny #metadata-container,
+    .layout-tiny #delay-controls {
+        display: none;
+    }
+
+    /* Compact mode styles */
+    .layout-compact #album-cover-container,
+    .layout-compact #sync-info-full,
+    .layout-compact #delay-controls {
+        display: none;
+    }
+
+    /* Standard mode styles */
+    .layout-standard #sync-info-full,
+    .layout-standard #delay-controls {
+        display: none;
+    }
+
+    .layout-standard #album-cover-container {
+        width: 30;
+    }
+
+    /* Full mode styles */
+    .layout-full #sync-info-compact {
+        display: none;
+    }
+
+    .layout-full #album-cover-container {
+        width: 50;
+    }
+
+    /* Layout containers */
     #content-area {
         height: 1fr;
         width: 100%;
@@ -457,14 +593,9 @@ class ResonateTUI(App[None]):
     }
 
     #album-cover-container {
-        width: auto;
         height: 100%;
         border: solid $primary;
         content-align: center middle;
-    }
-
-    #album-cover-container.hidden {
-        display: none;
     }
 
     #album-cover {
@@ -486,6 +617,12 @@ class ResonateTUI(App[None]):
         margin: 0 1;
     }
 
+    #sync-container {
+        height: auto;
+        padding: 0 2;
+        margin: 1 1 0 1;
+    }
+
     #progress-container {
         height: auto;
         padding: 1 2;
@@ -495,7 +632,6 @@ class ResonateTUI(App[None]):
     #song-progress {
         height: auto;
         width: 100%;
-        layout: vertical;
     }
 
     #volume-container {
@@ -512,6 +648,28 @@ class ResonateTUI(App[None]):
     #control-buttons {
         height: 3;
         align: center middle;
+    }
+
+    #delay-controls {
+        height: auto;
+        margin: 0 1;
+    }
+
+    #delay-buttons {
+        height: 3;
+        align: center middle;
+    }
+
+    #delay-buttons Button {
+        margin: 0 1;
+        min-width: 12;
+    }
+
+    #delay-label {
+        text-align: center;
+        content-align: center middle;
+        width: auto;
+        padding: 0 2;
     }
 
     #status-container {
@@ -559,20 +717,24 @@ class ResonateTUI(App[None]):
         ("plus", "volume_up", "Vol+"),
         ("minus", "volume_down", "Vol-"),
         ("m", "mute", "Mute"),
+        ("left_square_bracket", "delay_down_small", "-10ms"),
+        ("right_square_bracket", "delay_up_small", "+10ms"),
+        ("left_curly_bracket", "delay_down_large", "-50ms"),
+        ("right_curly_bracket", "delay_up_large", "+50ms"),
         ("question_mark", "help", "Help"),
         ("q", "quit", "Quit"),
     ]
 
-    # Reactive properties for better state management
+    # Reactive properties
     connected = reactive(False)  # noqa: FBT003
-    mini_mode = reactive(False)  # noqa: FBT003
+    layout_mode = reactive(LayoutMode.FULL)
 
     def __init__(
         self,
         client: ResonateClient,
         state: CLIState,
-        *args: object,
-        **kwargs: object,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
         """Initialize the Resonate TUI."""
         super().__init__(*args, **kwargs)
@@ -580,7 +742,6 @@ class ResonateTUI(App[None]):
         self._state = state
         self._last_album_art: AlbumArt | None = None
         self._update_task: asyncio.Task[None] | None = None
-        self._album_width = 50
 
     def compose(self) -> ComposeResult:
         """Compose the main UI layout."""
@@ -601,6 +762,11 @@ class ResonateTUI(App[None]):
                         yield Label("Artist: ", id="song-artist")
                         yield Label("Album: ", id="song-album")
 
+                    # Sync information
+                    with Container(id="sync-container"):
+                        yield SyncInfoWidget(id="sync-info-full")
+                        yield CompactSyncInfo(id="sync-info-compact")
+
                     # Progress bar
                     with Container(id="progress-container"):
                         yield SongProgressWidget(id="song-progress")
@@ -618,6 +784,12 @@ class ResonateTUI(App[None]):
                         id="controls",
                     )
 
+                    # Delay adjustment controls
+                    with Container(id="delay-controls"):
+                        yield DelayControlsWidget(
+                            on_adjust=self._handle_delay_adjust, id="delay-widget"
+                        )
+
             # Status bar
             with Container(id="status-container"):
                 yield Label("State: ", id="playback-state")
@@ -628,7 +800,7 @@ class ResonateTUI(App[None]):
         """Start the periodic update task."""
         self._update_task = asyncio.create_task(self._periodic_update())
         self._update_layout_for_size()
-        self.connected = True  # Assume connected on mount
+        self.connected = True
 
     def on_resize(self, _event: Resize) -> None:
         """Handle terminal resize."""
@@ -636,27 +808,27 @@ class ResonateTUI(App[None]):
 
     def _update_layout_for_size(self) -> None:
         """Update layout based on terminal size."""
+        terminal_width = self.size.width
+
+        # Determine layout mode
+        if terminal_width < 60:
+            self.layout_mode = LayoutMode.TINY
+        elif terminal_width < 80:
+            self.layout_mode = LayoutMode.COMPACT
+        elif terminal_width < 120:
+            self.layout_mode = LayoutMode.STANDARD
+        else:
+            self.layout_mode = LayoutMode.FULL
+
+    def watch_layout_mode(self, _new_mode: LayoutMode) -> None:
+        """Update CSS classes when layout mode changes."""
         try:
-            terminal_width = self.size.width
-
-            # Determine album cover visibility and width
-            album_container = self.query_one("#album-cover-container")
-
-            if terminal_width < 60:
-                # Mini mode - hide album art
-                album_container.add_class("hidden")
-                self.mini_mode = True
-            elif terminal_width < 100:
-                # Medium mode - small album art
-                album_container.remove_class("hidden")
-                album_container.styles.width = 30
-                self.mini_mode = False
-            else:
-                # Full mode - large album art
-                album_container.remove_class("hidden")
-                album_container.styles.width = 50
-                self.mini_mode = False
-
+            container = self.query_one("#main-container")
+            container.remove_class(
+                "layout-tiny", "layout-compact", "layout-standard", "layout-full"
+            )
+            container.add_class(f"layout-{self.layout_mode.value}")
+            logger.debug("Switched to %s layout mode", self.layout_mode.value)
         except (LookupError, RuntimeError):
             pass
 
@@ -670,11 +842,11 @@ class ResonateTUI(App[None]):
     async def _periodic_update(self) -> None:
         """Periodically update the UI from the state."""
         while True:
-            await asyncio.sleep(0.2)  # Faster updates
+            await asyncio.sleep(0.2)
             await self.update_ui()
 
     async def update_ui(self) -> None:
-        """Update all UI elements based on current state using reactive properties."""
+        """Update all UI elements based on current state."""
         try:
             # Update metadata
             title_label = self.query_one("#song-title", Label)
@@ -686,12 +858,23 @@ class ResonateTUI(App[None]):
             album_label = self.query_one("#song-album", Label)
             album_label.update(f"Album: {self._state.album or 'Unknown'}")
 
-            # Update progress using reactive properties
+            # Update sync info
+            sync_full = self.query_one("#sync-info-full", SyncInfoWidget)
+            sync_full.is_synchronized = self._client.is_time_synchronized()
+            sync_full.offset_us = self._client.sync_offset_us
+            sync_full.error_us = self._client.sync_error_us
+            sync_full.static_delay_ms = self._client.static_delay_ms
+
+            sync_compact = self.query_one("#sync-info-compact", CompactSyncInfo)
+            sync_compact.is_synchronized = self._client.is_time_synchronized()
+            sync_compact.static_delay_ms = self._client.static_delay_ms
+
+            # Update progress
             progress_widget = self.query_one("#song-progress", SongProgressWidget)
             progress_widget.progress = self._state.track_progress or 0
             progress_widget.duration = self._state.track_duration or 0
 
-            # Update volume slider using reactive properties
+            # Update volume slider
             volume_slider = self.query_one("#volume-slider", VolumeSlider)
             volume_slider.volume = self._state.volume if self._state.volume is not None else 0
             volume_slider.muted = self._state.muted or False
@@ -722,11 +905,9 @@ class ResonateTUI(App[None]):
             connection_status.status = "connected" if self.connected else "disconnected"
 
         except (LookupError, RuntimeError):
-            # Widgets not ready yet during initialization
             pass
 
     # Button handlers
-    # Note: Fire-and-forget tasks are intentional for UI handlers (RUF006)
     def _handle_previous(self) -> None:
         """Handle previous button."""
         _ = asyncio.create_task(self._send_command(MediaCommand.PREVIOUS))  # noqa: RUF006
@@ -746,8 +927,14 @@ class ResonateTUI(App[None]):
         """Handle next button."""
         _ = asyncio.create_task(self._send_command(MediaCommand.NEXT))  # noqa: RUF006
 
+    def _handle_delay_adjust(self, delta_ms: int) -> None:
+        """Handle delay adjustment."""
+        current = self._client.static_delay_ms
+        new_delay = current + delta_ms
+        self._client.set_static_delay_ms(new_delay)
+        logger.info("Adjusted delay: %+d ms (now %.0f ms)", delta_ms, new_delay)
+
     # Keyboard actions
-    # Note: Fire-and-forget tasks are intentional for UI handlers (RUF006)
     def action_play(self) -> None:
         """Play action."""
         _ = asyncio.create_task(self._send_command(MediaCommand.PLAY))  # noqa: RUF006
@@ -779,6 +966,22 @@ class ResonateTUI(App[None]):
     def action_mute(self) -> None:
         """Toggle mute."""
         _ = asyncio.create_task(self._toggle_mute())  # noqa: RUF006
+
+    def action_delay_down_small(self) -> None:
+        """Decrease delay by 10ms."""
+        self._handle_delay_adjust(-10)
+
+    def action_delay_up_small(self) -> None:
+        """Increase delay by 10ms."""
+        self._handle_delay_adjust(10)
+
+    def action_delay_down_large(self) -> None:
+        """Decrease delay by 50ms."""
+        self._handle_delay_adjust(-50)
+
+    def action_delay_up_large(self) -> None:
+        """Increase delay by 50ms."""
+        self._handle_delay_adjust(50)
 
     def action_help(self) -> None:
         """Show help screen."""
