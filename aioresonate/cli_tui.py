@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING, ClassVar
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from aioresonate.client import ResonateClient
 
 from aioresonate.models.types import MediaCommand, PlaybackStateType
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -63,12 +66,21 @@ class AlbumCoverWidget(Static):
             # Load image using PIL
             image = Image.open(BytesIO(album_art.image_data))
 
+            # Log image info for debugging
+            logger.debug(
+                "Loading album art: format=%s, size=%s, mode=%s, data_len=%d",
+                album_art.format,
+                image.size,
+                image.mode,
+                len(album_art.image_data),
+            )
+
             # Remove old image widget if it exists
             if self._image_widget is not None:
                 await self._image_widget.remove()
                 self._image_widget = None
 
-            # Create new image widget
+            # Create new image widget with the PIL image
             self._image_widget = TextualImage(image)
             await self.mount(self._image_widget)
 
@@ -76,8 +88,14 @@ class AlbumCoverWidget(Static):
             placeholder.display = False
             self._image_widget.display = True
 
-        except (OSError, ValueError) as e:
-            placeholder.update(f"Error: {e}")
+            logger.info("Album art loaded successfully")
+
+        except (OSError, ValueError, ImportError) as e:
+            # Show error persistently
+            logger.exception("Failed to load album art")
+
+            error_msg = f"Album art error:\n{type(e).__name__}: {e}"
+            placeholder.update(error_msg)
             placeholder.display = True
             if self._image_widget is not None:
                 self._image_widget.display = False
@@ -406,7 +424,12 @@ class ResonateTUI(App[None]):
             controls.update_play_pause_button(is_playing)
 
             # Update album art if changed
-            if self._state.album_art != self._last_album_art:
+            if self._state.album_art is not self._last_album_art:
+                logger.debug(
+                    "Album art changed: old=%s, new=%s",
+                    self._last_album_art is not None,
+                    self._state.album_art is not None,
+                )
                 self._last_album_art = self._state.album_art
                 album_cover = self.query_one("#album-cover", AlbumCoverWidget)
                 await album_cover.update_album_art(self._state.album_art)
