@@ -607,7 +607,7 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
 
         # Wrap audio stream start to also track metadata
         async def on_stream_start_wrapper(message: StreamStartMessage) -> None:
-            await audio_handler.on_stream_start(message)
+            audio_handler.on_stream_start(message)
             await _handle_stream_start_metadata(state, message)
 
         client.set_stream_start_listener(on_stream_start_wrapper)
