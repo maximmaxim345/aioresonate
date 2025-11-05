@@ -95,9 +95,8 @@ class SongProgressWidget(Static):
 
     def compose(self) -> ComposeResult:
         """Compose the progress widget."""
-        with Vertical():
-            yield ProgressBar(total=100, show_eta=False, id="progress-bar")
-            yield Label("0:00 / 0:00", id="progress-time")
+        yield ProgressBar(total=100, show_eta=False, id="progress-bar")
+        yield Label("0:00 / 0:00", id="progress-time")
 
     def update_progress(self, progress_seconds: int | None, duration_seconds: int | None) -> None:
         """Update the progress bar and time display."""
@@ -196,47 +195,99 @@ class ResonateTUI(App[None]):
     """Textual UI for Resonate CLI client."""
 
     CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #main-container {
+        height: 1fr;
+        width: 100%;
+        layout: vertical;
+    }
+
+    #content-area {
+        height: 1fr;
+        width: 100%;
+        layout: horizontal;
+    }
+
     #album-cover-container {
-        height: 20;
-        width: 40;
-        border: solid green;
-        padding: 1;
+        width: 50;
+        height: 100%;
+        border: solid $primary;
+        content-align: center middle;
+    }
+
+    #album-cover {
+        width: 100%;
+        height: 100%;
+        content-align: center middle;
+    }
+
+    #right-panel {
+        width: 1fr;
+        height: 100%;
+        layout: vertical;
     }
 
     #metadata-container {
         height: auto;
-        padding: 1;
-        border: solid blue;
+        border: solid $accent;
+        padding: 1 2;
+        margin: 0 1;
     }
 
     #progress-container {
         height: auto;
-        padding: 1;
+        padding: 1 2;
+        margin: 1 1;
+    }
+
+    #song-progress {
+        height: auto;
+        width: 100%;
+        layout: vertical;
+    }
+
+    #controls {
+        height: auto;
+        margin: 0 1;
     }
 
     #control-buttons {
-        height: auto;
+        height: 3;
         align: center middle;
-        padding: 1;
     }
 
     #status-container {
         height: auto;
-        padding: 1;
-        border: solid yellow;
+        border: solid $warning;
+        padding: 1 2;
+        margin: 1 0 0 0;
     }
 
     Button {
         margin: 0 1;
+        min-width: 10;
     }
 
     #progress-bar {
         width: 100%;
+        margin: 0 0 1 0;
     }
 
     #progress-time {
         text-align: center;
         width: 100%;
+    }
+
+    Label {
+        width: 100%;
+    }
+
+    #album-placeholder {
+        text-align: center;
+        content-align: center middle;
     }
     """
 
@@ -271,21 +322,21 @@ class ResonateTUI(App[None]):
         yield Header()
 
         with Container(id="main-container"):
-            with Horizontal():
+            with Horizontal(id="content-area"):
                 # Left side: Album cover
-                with Vertical(id="album-cover-container"):
+                with Container(id="album-cover-container"):
                     yield AlbumCoverWidget(id="album-cover")
 
                 # Right side: Metadata and controls
-                with Vertical():
+                with Vertical(id="right-panel"):
                     # Song metadata
-                    with Vertical(id="metadata-container"):
+                    with Container(id="metadata-container"):
                         yield Label("Title: ", id="song-title")
                         yield Label("Artist: ", id="song-artist")
                         yield Label("Album: ", id="song-album")
 
                     # Progress bar
-                    with Vertical(id="progress-container"):
+                    with Container(id="progress-container"):
                         yield SongProgressWidget(id="song-progress")
 
                     # Control buttons
@@ -298,7 +349,7 @@ class ResonateTUI(App[None]):
                     )
 
             # Status bar
-            with Vertical(id="status-container"):
+            with Container(id="status-container"):
                 yield Label("Volume: ", id="volume-status")
                 yield Label("State: ", id="playback-state")
 
