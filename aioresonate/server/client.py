@@ -10,26 +10,19 @@ from typing import TYPE_CHECKING, cast
 from aiohttp import ClientWebSocketResponse, WSMessage, WSMsgType, web
 
 from aioresonate.models import unpack_binary_header
-from aioresonate.models.controller import (
-    GroupCommandClientMessage,
-    GroupGetListClientMessage,
-    GroupJoinClientMessage,
-    GroupUnjoinClientMessage,
-)
 from aioresonate.models.core import (
+    ClientCommandMessage,
     ClientHelloMessage,
     ClientHelloPayload,
+    ClientStateMessage,
     ClientTimeMessage,
     ServerHelloMessage,
     ServerHelloPayload,
     ServerTimeMessage,
     ServerTimePayload,
-)
-from aioresonate.models.player import (
-    PlayerUpdateMessage,
     StreamRequestFormatMessage,
 )
-from aioresonate.models.types import ClientMessage, Roles, ServerMessage
+from aioresonate.models.types import BinaryMessageType, ClientMessage, Roles, ServerMessage
 
 from .controller import ControllerClient
 from .events import ClientEvent, ClientGroupChangedEvent
@@ -101,6 +94,10 @@ class ResonateClient:
     _group: ResonateGroup
     _event_cbs: list[Callable[[ClientEvent], Coroutine[None, None, None]]]
     _closing: bool = False
+    _disconnecting: bool = False
+    """Flag to prevent multiple concurrent disconnect tasks."""
+    _server_hello_sent: bool = False
+    """Flag to track if server/hello has been sent to complete handshake."""
     disconnect_behaviour: DisconnectBehaviour
     """
     Controls the disconnect behavior for this client.
@@ -159,6 +156,8 @@ class ResonateClient:
         self._group = ResonateGroup(server, self)
         self._event_cbs = []
         self._closing = False
+        self._disconnecting = False
+        self._server_hello_sent = False
         self._roles = []
         self.disconnect_behaviour = DisconnectBehaviour.UNGROUP
 
@@ -166,6 +165,7 @@ class ResonateClient:
         """Disconnect this client from the server."""
         if not retry_connection:
             self._closing = True
+        self._disconnecting = True
         self._logger.debug("Disconnecting client")
 
         if self.disconnect_behaviour == DisconnectBehaviour.UNGROUP:
@@ -381,6 +381,20 @@ class ResonateClient:
                 if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
                     break
 
+                if msg.type == WSMsgType.BINARY:
+                    # Per spec, clients should not send binary messages
+                    # Binary messages should be rejected if there is no active stream
+                    if not self._group.has_active_stream:
+                        self._logger.warning(
+                            "Received binary message from client with no active stream, rejecting"
+                        )
+                    else:
+                        self._logger.warning(
+                            "Received binary message from client "
+                            "(clients should not send binary data)"
+                        )
+                    continue
+
                 if msg.type != WSMsgType.TEXT:
                     continue
 
@@ -431,6 +445,15 @@ class ResonateClient:
         """Handle incoming commands from the client."""
         if self._client_info is None and not isinstance(message, ClientHelloMessage):
             raise ValueError("First message must be client/hello")
+
+        # Check that other messages are not sent before server/hello
+        if (
+            self._client_info is not None
+            and not self._server_hello_sent
+            and not isinstance(message, ClientHelloMessage)
+        ):
+            raise ValueError("Cannot send messages before receiving server/hello")
+
         match message:
             # Core messages
             case ClientHelloMessage(client_info):
@@ -460,6 +483,7 @@ class ResonateClient:
                         )
                     )
                 )
+                self._server_hello_sent = True
             case ClientTimeMessage(client_time):
                 self.send_message(
                     ServerTimeMessage(
@@ -471,20 +495,15 @@ class ResonateClient:
                     )
                 )
             # Player messages
-            case PlayerUpdateMessage(state):
-                self.require_player.handle_player_update(state)
+            case ClientStateMessage(payload):
+                if payload.player:
+                    self.require_player.handle_player_update(payload.player)
             case StreamRequestFormatMessage(payload):
-                self._ensure_role(Roles.PLAYER)
                 self.group.handle_stream_format_request(self, payload)
             # Controller messages
-            case GroupGetListClientMessage() as group_get_list:
-                self.require_controller.handle_get_list(group_get_list)
-            case GroupJoinClientMessage(payload):
-                self.require_controller.handle_join(payload)
-            case GroupUnjoinClientMessage() as group_unjoin:
-                self.require_controller.handle_unjoin(group_unjoin)
-            case GroupCommandClientMessage(group_command):
-                self.require_controller.handle_command(group_command)
+            case ClientCommandMessage(payload):
+                if payload.controller:
+                    await self.require_controller.handle_command(payload.controller)
 
     async def _writer(self) -> None:
         """Write outgoing messages from the queue."""
@@ -498,15 +517,20 @@ class ResonateClient:
                 if isinstance(item, bytes):
                     # Unpack binary header using helper function
                     header = unpack_binary_header(item)
-                    now = int(self._server.loop.time() * 1_000_000)
-                    if header.timestamp_us - now < 0:
-                        self._logger.error("Audio chunk should have played already, skipping it")
-                        continue
-                    if header.timestamp_us - now < 500_000:
-                        self._logger.warning(
-                            "sending audio chunk that needs to be played very soon (in %d us)",
-                            (header.timestamp_us - now),
-                        )
+
+                    # Only validate timestamps for audio chunks, since they are time-sensitive
+                    if header.message_type == BinaryMessageType.AUDIO_CHUNK.value:
+                        now = int(self._server.loop.time() * 1_000_000)
+                        if header.timestamp_us - now < 0:
+                            self._logger.error(
+                                "Audio chunk should have played already, skipping it"
+                            )
+                            continue
+                        if header.timestamp_us - now < 500_000:
+                            self._logger.warning(
+                                "sending audio chunk that needs to be played very soon (in %d us)",
+                                (header.timestamp_us - now),
+                            )
                     try:
                         await wsock.send_bytes(item)
                     except ConnectionError:
@@ -539,14 +563,20 @@ class ResonateClient:
         NOTE: Binary messages are directly sent to the client, you need to add the
         header yourself using pack_binary_header().
         """
-        # TODO: handle full queue
+        try:
+            self._to_write.put_nowait(message)
+        except asyncio.QueueFull:
+            # Only trigger disconnect once, even if queue fills repeatedly
+            if not self._disconnecting:
+                self._logger.error("Message queue full, client too slow - disconnecting")
+                task = self._server.loop.create_task(self.disconnect(retry_connection=True))
+                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            return
+
         if isinstance(message, bytes):
-            # Only log binary messages occasionally to reduce spam
             pass
         elif not isinstance(message, ServerTimeMessage):
-            # Only log important non-time messages
             self._logger.debug("Enqueueing message: %s", type(message).__name__)
-        self._to_write.put_nowait(message)
 
     def add_event_listener(
         self, callback: Callable[[ClientEvent], Coroutine[None, None, None]]
@@ -565,4 +595,5 @@ class ResonateClient:
 
     def _signal_event(self, event: ClientEvent) -> None:
         for cb in self._event_cbs:
-            self._server.loop.create_task(cb(event))
+            task = self._server.loop.create_task(cb(event))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)

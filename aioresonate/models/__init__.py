@@ -5,17 +5,21 @@ from __future__ import annotations
 __all__ = [
     "BINARY_HEADER_FORMAT",
     "BINARY_HEADER_SIZE",
+    "AudioCodec",
     "BinaryHeader",
     "BinaryMessageType",
     "ClientMessage",
+    "DeviceInfo",
     "MediaCommand",
     "PictureFormat",
     "PlaybackStateType",
+    "PlayerCommand",
     "PlayerStateType",
     "RepeatMode",
     "Roles",
     "ServerMessage",
     "UndefinedField",
+    "artwork",
     "controller",
     "core",
     "metadata",
@@ -30,13 +34,16 @@ __all__ = [
 import struct
 from typing import NamedTuple
 
-from . import controller, core, metadata, player, types, visualizer
+from . import artwork, controller, core, metadata, player, types, visualizer
+from .core import DeviceInfo
 from .types import (
+    AudioCodec,
     BinaryMessageType,
     ClientMessage,
     MediaCommand,
     PictureFormat,
     PlaybackStateType,
+    PlayerCommand,
     PlayerStateType,
     RepeatMode,
     Roles,

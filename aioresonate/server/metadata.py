@@ -9,8 +9,6 @@ from aioresonate.models.metadata import SessionUpdateMetadata
 from aioresonate.models.types import RepeatMode
 
 if TYPE_CHECKING:
-    from aioresonate.models.metadata import ClientHelloMetadataSupport
-
     from .client import ResonateClient
 
 
@@ -33,15 +31,15 @@ class Metadata:
     track: int | None = None
     """Track number of the current media."""
     track_duration: int | None = None
-    """Track duration in seconds."""
-    playback_speed: int | None = 1
-    """Speed factor, 1.0 is normal speed."""
+    """Track duration in milliseconds."""
+    playback_speed: int | None = None
+    """Playback speed multiplier * 1000 (e.g., 1000 = normal speed, 1500 = 1.5x speed)."""
     repeat: RepeatMode | None = None
     """Current repeat mode."""
     shuffle: bool | None = None
     """Whether shuffle is enabled."""
-
-    # TODO: inject track_progress and timestamp when sending updates?
+    track_progress: int | None = None
+    """Track progress in milliseconds at the last update time."""
 
     def diff_update(self, last: Metadata | None, timestamp: int) -> SessionUpdateMetadata:
         """Build a SessionUpdateMetadata containing only changed fields compared to last."""
@@ -70,6 +68,9 @@ class Metadata:
             metadata_update.repeat = self.repeat
         if last is None or last.shuffle != self.shuffle:
             metadata_update.shuffle = self.shuffle
+        # Always send track_progress if set (clients need fresh timestamp for progress calculation)
+        if self.track_progress is not None:
+            metadata_update.track_progress = self.track_progress
 
         return metadata_update
 
@@ -88,6 +89,7 @@ class Metadata:
         metadata_update.playback_speed = None
         metadata_update.repeat = None
         metadata_update.shuffle = None
+        metadata_update.track_progress = None
         return metadata_update
 
     def snapshot_update(self, timestamp: int) -> SessionUpdateMetadata:
@@ -104,6 +106,7 @@ class Metadata:
         metadata_update.playback_speed = self.playback_speed
         metadata_update.repeat = self.repeat
         metadata_update.shuffle = self.shuffle
+        metadata_update.track_progress = self.track_progress
         return metadata_update
 
 
@@ -114,8 +117,3 @@ class MetadataClient:
         """Attach to a client that exposes metadata capabilities."""
         self.client = client
         self._logger = client._logger.getChild("metadata")  # noqa: SLF001
-
-    @property
-    def support(self) -> ClientHelloMetadataSupport | None:
-        """Return metadata capabilities advertised in the hello payload."""
-        return self.client.info.metadata_support

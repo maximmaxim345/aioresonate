@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import platform
 import signal
 import socket
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import partial
+from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -24,10 +28,21 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncZeroconf
 from aioresonate.cli_audio import AudioPlayer
 from aioresonate.client import PCMFormat, ResonateClient
 from aioresonate.models.controller import GroupUpdateServerPayload
-from aioresonate.models.core import SessionUpdatePayload, StreamStartMessage
-from aioresonate.models.metadata import ClientHelloMetadataSupport, SessionUpdateMetadata
-from aioresonate.models.player import ClientHelloPlayerSupport
-from aioresonate.models.types import MediaCommand, PlaybackStateType, Roles, UndefinedField
+from aioresonate.models.core import (
+    DeviceInfo,
+    ServerStatePayload,
+    StreamStartMessage,
+)
+from aioresonate.models.metadata import SessionUpdateMetadata
+from aioresonate.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aioresonate.models.types import (
+    AudioCodec,
+    MediaCommand,
+    PlaybackStateType,
+    PlayerCommand,
+    Roles,
+    UndefinedField,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +87,9 @@ class CLIState:
         if self.album:
             lines.append(f"Album: {self.album}")
         if self.track_duration:
-            progress = self.track_progress or 0
-            lines.append(f"Progress: {progress:>2} / {self.track_duration:>2} s")
+            progress_s = (self.track_progress or 0) / 1000
+            duration_s = self.track_duration / 1000
+            lines.append(f"Progress: {progress_s:>5.1f} / {duration_s:>5.1f} s")
         if self.volume is not None:
             vol_line = f"Volume: {self.volume}%"
             if self.muted:
@@ -141,6 +157,52 @@ def _build_service_url(host: str, port: int, properties: dict[bytes, bytes | Non
         path = "/" + path
     host_fmt = f"[{host}]" if ":" in host else host
     return f"ws://{host_fmt}:{port}{path}"
+
+
+def _get_device_info() -> DeviceInfo:
+    """Get device information for the client hello message."""
+    # Get OS/platform information
+    system = platform.system()
+    product_name = f"{system}"
+
+    # Try to get more specific product info
+    if system == "Linux":
+        # Try reading /etc/os-release for distribution info
+        try:
+            os_release = Path("/etc/os-release")
+            if os_release.exists():
+                with os_release.open() as f:
+                    for line in f:
+                        if line.startswith("PRETTY_NAME="):
+                            product_name = line.split("=", 1)[1].strip().strip('"')
+                            break
+        except (OSError, IndexError):
+            pass
+    elif system == "Darwin":
+        mac_version = platform.mac_ver()[0]
+        product_name = f"macOS {mac_version}" if mac_version else "macOS"
+    elif system == "Windows":
+        try:
+            win_ver = platform.win32_ver()
+            # Check build number to distinguish Windows 11 (build 22000+) from Windows 10
+            if win_ver[0] == "10" and win_ver[1] and int(win_ver[1].split(".")[2]) >= 22000:
+                product_name = "Windows 11"
+            else:
+                product_name = f"Windows {win_ver[0]}"
+        except (ValueError, IndexError, AttributeError):
+            product_name = f"Windows {platform.release()}"
+
+    # Get software version
+    try:
+        software_version = f"aioresonate {version('aioresonate')}"
+    except Exception:  # noqa: BLE001
+        software_version = "aioresonate (unknown version)"
+
+    return DeviceInfo(
+        product_name=product_name,
+        manufacturer=None,  # Could add manufacturer detection if needed
+        software_version=software_version,
+    )
 
 
 def list_audio_devices() -> None:
@@ -227,6 +289,7 @@ class _ServiceDiscoveryListener:
         task = self._loop.create_task(self._process_service_info(zeroconf, service_type, name))
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     def add_service(self, zeroconf: AsyncZeroconf, service_type: str, name: str) -> None:
         self._schedule(zeroconf, service_type, name)
@@ -546,17 +609,18 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
         client_id=client_id,
         client_name=client_name,
         roles=[Roles.CONTROLLER, Roles.PLAYER, Roles.METADATA],
+        device_info=_get_device_info(),
         player_support=ClientHelloPlayerSupport(
-            support_codecs=["pcm"],
-            support_channels=[2, 1],
-            support_sample_rates=[44_100],
-            support_bit_depth=[16],
+            support_formats=[
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM, channels=2, sample_rate=44_100, bit_depth=16
+                ),
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM, channels=1, sample_rate=44_100, bit_depth=16
+                ),
+            ],
             buffer_capacity=32_000_000,
-        ),
-        metadata_support=ClientHelloMetadataSupport(
-            support_picture_formats=[],
-            media_width=None,
-            media_height=None,
+            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
         ),
         static_delay_ms=args.static_delay_ms,
     )
@@ -594,8 +658,9 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
         # Create audio and stream handlers
         audio_handler = AudioStreamHandler(client, audio_device=audio_device)
 
-        client.set_metadata_listener(lambda payload: _handle_session_update(state, payload))
+        client.set_metadata_listener(lambda payload: _handle_metadata_update(state, payload))
         client.set_group_update_listener(lambda payload: _handle_group_update(state, payload))
+        client.set_controller_state_listener(lambda payload: _handle_server_state(state, payload))
         client.set_stream_start_listener(audio_handler.on_stream_start)
         client.set_stream_end_listener(audio_handler.on_stream_end)
         client.set_audio_chunk_listener(audio_handler.on_audio_chunk)
@@ -614,7 +679,9 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
             logger.debug("Received interrupt signal, shutting down...")
             keyboard_task.cancel()
 
-        loop.add_signal_handler(signal.SIGINT, signal_handler)
+        # Signal handlers aren't supported on this platform (e.g., Windows)
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(signal.SIGINT, signal_handler)
 
         try:
             # Run connection loop with auto-reconnect
@@ -623,7 +690,9 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
             logger.debug("Connection loop cancelled")
         finally:
             # Remove signal handler
-            loop.remove_signal_handler(signal.SIGINT)
+            # Signal handlers aren't supported on this platform (e.g., Windows)
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(signal.SIGINT)
             await audio_handler.cleanup()
             await client.disconnect()
 
@@ -634,30 +703,33 @@ async def main_async(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0915
     return 0
 
 
-async def _handle_session_update(state: CLIState, payload: SessionUpdatePayload) -> None:
-    if payload.playback_state is not None and payload.playback_state != state.playback_state:
-        state.playback_state = payload.playback_state
-        _print_event(f"Playback state: {payload.playback_state.value}")
-
+async def _handle_metadata_update(state: CLIState, payload: ServerStatePayload) -> None:
+    """Handle server/state messages with metadata."""
     if payload.metadata is not None and state.update_metadata(payload.metadata):
         _print_event(state.describe())
 
 
-async def _handle_group_update(state: CLIState, payload: GroupUpdateServerPayload) -> None:
-    supported: set[MediaCommand] = set()
-    for command in payload.supported_commands:
-        try:
-            supported.add(command if isinstance(command, MediaCommand) else MediaCommand(command))
-        except ValueError:
-            continue
-    state.supported_commands = supported
+async def _handle_group_update(_state: CLIState, payload: GroupUpdateServerPayload) -> None:
+    if payload.playback_state:
+        _print_event(f"Playback state: {payload.playback_state.value}")
+    if payload.group_id:
+        _print_event(f"Group ID: {payload.group_id}")
+    if payload.group_name:
+        _print_event(f"Group name: {payload.group_name}")
 
-    if payload.volume != state.volume:
-        state.volume = payload.volume
-        _print_event(f"Volume: {payload.volume}%")
-    if payload.muted != state.muted:
-        state.muted = payload.muted
-        _print_event("Muted" if payload.muted else "Unmuted")
+
+async def _handle_server_state(state: CLIState, payload: ServerStatePayload) -> None:
+    """Handle server/state messages with controller state."""
+    if payload.controller:
+        controller = payload.controller
+        state.supported_commands = set(controller.supported_commands)
+
+        if controller.volume != state.volume:
+            state.volume = controller.volume
+            _print_event(f"Volume: {controller.volume}%")
+        if controller.muted != state.muted:
+            state.muted = controller.muted
+            _print_event("Muted" if controller.muted else "Unmuted")
 
 
 class CommandHandler:

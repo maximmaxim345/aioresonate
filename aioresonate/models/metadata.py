@@ -2,9 +2,8 @@
 Metadata messages for the Resonate protocol.
 
 This module contains messages specific to clients with the metadata role, which
-handle display of track information, artwork, and playback state. Metadata clients
-receive session updates with track details and can optionally receive artwork in
-their preferred format and resolution.
+handle display of track information and playback progress. Metadata clients
+receive state updates with track details.
 """
 
 from __future__ import annotations
@@ -14,64 +13,16 @@ from dataclasses import dataclass, field
 from mashumaro.config import BaseConfig
 from mashumaro.mixins.orjson import DataClassORJSONMixin
 
-from .types import PictureFormat, RepeatMode, UndefinedField, undefined_field
+from .types import RepeatMode, UndefinedField, undefined_field
 
 
-# Client -> Server: client/hello metadata support object
-@dataclass
-class ClientHelloMetadataSupport(DataClassORJSONMixin):
-    """Metadata support configuration - only if metadata role is set."""
-
-    support_picture_formats: list[str]
-    """Supported media art image formats (empty array if no art desired)."""
-    media_width: int | None = None
-    """Max width in pixels (if only width set, scales preserving aspect ratio)."""
-    media_height: int | None = None
-    """Max height in pixels (if only height set, scales preserving aspect ratio)."""
-
-    def __post_init__(self) -> None:
-        """Validate field values."""
-        if self.media_width is not None and self.media_width <= 0:
-            raise ValueError(f"media_width must be positive, got {self.media_width}")
-
-        if self.media_height is not None and self.media_height <= 0:
-            raise ValueError(f"media_height must be positive, got {self.media_height}")
-
-    class Config(BaseConfig):
-        """Config for parsing json messages."""
-
-        omit_none = True
-
-
-# Server -> Client: stream/start metadata object
-@dataclass
-class StreamStartMetadata(DataClassORJSONMixin):
-    """
-    Metadata object in stream/start message.
-
-    Sent to clients that specified supported picture formats.
-    """
-
-    art_format: PictureFormat
-    """Format of the encoded image."""
-
-
-# Server -> Client: stream/update metadata object
-@dataclass
-class StreamUpdateMetadata(DataClassORJSONMixin):
-    """Metadata object in stream/update message with delta updates."""
-
-    art_format: PictureFormat
-    """Format of the encoded image."""
-
-
-# Server -> Client: session/update metadata object
+# Server -> Client: server/state metadata object
 @dataclass
 class SessionUpdateMetadata(DataClassORJSONMixin):
-    """Metadata object in session/update message."""
+    """Metadata object in server/state message."""
 
     timestamp: int
-    """Server timestamp for when this metadata is valid."""
+    """Server clock time in microseconds for when this metadata is valid."""
     title: str | None | UndefinedField = field(default_factory=undefined_field)
     artist: str | None | UndefinedField = field(default_factory=undefined_field)
     album_artist: str | None | UndefinedField = field(default_factory=undefined_field)
@@ -80,11 +31,11 @@ class SessionUpdateMetadata(DataClassORJSONMixin):
     year: int | None | UndefinedField = field(default_factory=undefined_field)
     track: int | None | UndefinedField = field(default_factory=undefined_field)
     track_progress: int | None | UndefinedField = field(default_factory=undefined_field)
-    """Track progress in seconds."""
+    """Track progress in milliseconds."""
     track_duration: int | None | UndefinedField = field(default_factory=undefined_field)
-    """Track duration in seconds."""
+    """Track duration in milliseconds."""
     playback_speed: int | None | UndefinedField = field(default_factory=undefined_field)
-    """Speed factor."""
+    """Playback speed multiplier * 1000."""
     repeat: RepeatMode | None | UndefinedField = field(default_factory=undefined_field)
     shuffle: bool | None | UndefinedField = field(default_factory=undefined_field)
 

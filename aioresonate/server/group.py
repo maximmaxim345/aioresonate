@@ -6,11 +6,12 @@ import asyncio
 import logging
 import uuid
 from asyncio import Task
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 from PIL import Image
 
@@ -18,22 +19,34 @@ from aioresonate.models import (
     BinaryMessageType,
     pack_binary_header_raw,
 )
-from aioresonate.models.controller import GroupCommandClientPayload
+from aioresonate.models.artwork import (
+    ArtworkChannel,
+    StreamArtworkChannelConfig,
+    StreamArtworkChannelConfigUpdate,
+    StreamStartArtwork,
+    StreamUpdateArtwork,
+)
+from aioresonate.models.controller import (
+    ControllerCommandPayload,
+    ControllerStatePayload,
+    GroupUpdateServerMessage,
+    GroupUpdateServerPayload,
+)
 from aioresonate.models.core import (
-    SessionUpdateMessage,
-    SessionUpdatePayload,
+    ServerStateMessage,
+    ServerStatePayload,
     StreamEndMessage,
+    StreamRequestFormatPayload,
     StreamStartMessage,
     StreamStartPayload,
-)
-from aioresonate.models.metadata import (
-    StreamStartMetadata,
+    StreamUpdateMessage,
+    StreamUpdatePayload,
 )
 from aioresonate.models.player import (
-    StreamRequestFormatPayload,
     StreamStartPlayer,
 )
 from aioresonate.models.types import (
+    ArtworkSource,
     MediaCommand,
     PictureFormat,
     PlaybackStateType,
@@ -106,10 +119,10 @@ class GroupDeletedEvent(GroupEvent):
 
 @dataclass
 class _StreamerReconfigureCommand:
-    """Request to reconfigure the running streamer with new client topology."""
+    """Signal to reconfigure the running streamer with new player topology."""
 
-    audio_format: AudioFormat
-    client_configs: list[ClientStreamConfig]
+    all_player_configs: list[ClientStreamConfig]
+    """List of ClientStreamConfig for all players (existing and new)."""
 
 
 class ResonateGroup:
@@ -123,18 +136,16 @@ class ResonateGroup:
 
     _clients: list[ResonateClient]
     """List of all clients in this group."""
-    _player_formats: dict[str, AudioFormat]
-    """Mapping of client IDs (with the player role) to their selected audio formats."""
-    _client_art_formats: dict[str, PictureFormat]
-    """Mapping of client IDs (with the metadata role) to their selected artwork formats."""
+    _client_artwork_state: dict[str, dict[int, ArtworkChannel]]
+    """Mapping of client IDs to their per-channel artwork state (channel 0-3)."""
     _server: ResonateServer
     """Reference to the ResonateServer instance."""
     _stream_task: Task[int] | None = None
     """Task handling the audio streaming loop, None when not streaming."""
     _current_metadata: Metadata | None = None
     """Current metadata for the group, None if no metadata set."""
-    _current_media_art: Image.Image | None = None
-    """Current media art image for the group, None if no image set."""
+    _current_media_art: dict[ArtworkSource, Image.Image]
+    """Current media art images for the group, keyed by source type."""
     _audio_encoders: dict[AudioFormat, av.AudioCodecContext]
     """Mapping of audio formats to their base64 encoded headers."""
     _preferred_stream_codec: AudioCodec = AudioCodec.OPUS
@@ -145,6 +156,8 @@ class ResonateGroup:
     """Current playback state of the group."""
     _group_id: str
     """Unique identifier for this group."""
+    _group_name: str | None
+    """Friendly name for this group."""
     _streamer: Streamer | None
     """Active Streamer instance for the current stream, None when not streaming."""
     _media_stream: MediaStream | None
@@ -153,8 +166,14 @@ class ResonateGroup:
     """Command queue for the active streamer task, None when not streaming."""
     _play_start_time_us: int | None
     """Absolute timestamp in microseconds when playback started, None when not streaming."""
+    _track_progress_timestamp_us: int | None
+    """Timestamp in microseconds when track_progress was last updated, for progress calculation."""
     _scheduled_stop_handle: asyncio.TimerHandle | None
     """Timer handle for scheduled stop, None when no stop is scheduled."""
+    _muted: bool
+    """Group mute state."""
+    _last_sent_volume: int | None
+    """Last volume sent to controller clients, for change detection."""
 
     def __init__(self, server: ResonateServer, *args: ResonateClient) -> None:
         """
@@ -169,20 +188,23 @@ class ResonateGroup:
             *args: Clients to add to this group.
         """
         self._clients = list(args)
-        self._player_formats = {}
-        self._client_art_formats = {}
+        self._client_artwork_state = {}
         self._server = server
         self._stream_task: Task[int] | None = None
         self._current_metadata = None
-        self._current_media_art = None
+        self._current_media_art = {}
         self._audio_encoders = {}
         self._event_cbs = []
         self._group_id = str(uuid.uuid4())
+        self._group_name: str | None = None
         self._streamer: Streamer | None = None
         self._media_stream: MediaStream | None = None
         self._stream_commands: asyncio.Queue[_StreamerReconfigureCommand] | None = None
         self._play_start_time_us: int | None = None
+        self._track_progress_timestamp_us: int | None = None
         self._scheduled_stop_handle: asyncio.TimerHandle | None = None
+        self._muted = False
+        self._last_sent_volume: int | None = None
         logger.debug(
             "ResonateGroup initialized with %d client(s): %s",
             len(self._clients),
@@ -223,40 +245,31 @@ class ResonateGroup:
             self._current_state = PlaybackStateType.STOPPED
             return start_time_us
 
-        self._player_formats.clear()
-
-        for player in group_players:
-            client = player.client
-            player_format = player.determine_optimal_format(media_stream.audio_format)
-            self._player_formats[client.client_id] = player_format
-
         streamer = Streamer(
             loop=self._server.loop,
             play_start_time_us=start_time_us,
         )
+        self._streamer = streamer
+        self._media_stream = media_stream
 
-        client_configs: list[ClientStreamConfig] = []
+        # Build configs for all players (all are new for initial setup)
+        all_player_configs: list[ClientStreamConfig] = []
         for player in group_players:
-            support = player.support
-            if support is None:
-                raise ValueError(f"Player {player.client.client_id} lacks support payload")
-            client_configs.append(
+            assert player.support
+            target_format = player.determine_optimal_format(media_stream.main_channel[1])
+            all_player_configs.append(
                 ClientStreamConfig(
                     client_id=player.client.client_id,
-                    target_format=self._player_formats[player.client.client_id],
-                    buffer_capacity_bytes=support.buffer_capacity,
+                    target_format=target_format,
+                    buffer_capacity_bytes=player.support.buffer_capacity,
                     send=player.client.send_message,
                 )
             )
 
-        start_payloads = streamer.configure(
-            audio_format=media_stream.audio_format,
-            clients=client_configs,
-        )
-        self._streamer = streamer
+        start_payloads, channel_sources = await streamer.configure(all_player_configs, media_stream)
         self._stream_commands = asyncio.Queue()
         self._stream_task = self._server.loop.create_task(
-            self._run_streamer(streamer, media_stream)
+            self._run_streamer(streamer, media_stream, channel_sources)
         )
 
         # Notify clients about the upcoming stream configuration
@@ -276,6 +289,7 @@ class ResonateGroup:
 
         self._current_state = PlaybackStateType.PLAYING
         self._signal_event(GroupStateChangedEvent(PlaybackStateType.PLAYING))
+        self._send_group_update_to_clients()
 
         end_time_us = start_time_us
         if self._stream_task is not None:
@@ -288,110 +302,256 @@ class ResonateGroup:
 
         return end_time_us
 
-    async def _run_streamer(  # noqa: PLR0915
+    def _send_group_update_to_clients(self) -> None:
+        """Send group/update and server/state messages to all clients."""
+        playback_state = (
+            PlaybackStateType.PLAYING
+            if self._current_state == PlaybackStateType.PLAYING
+            else PlaybackStateType.PAUSED
+        )
+        group_message = GroupUpdateServerMessage(
+            GroupUpdateServerPayload(
+                playback_state=playback_state,
+                group_id=self._group_id,
+                group_name=self._group_name,
+            )
+        )
+        controller_state = ControllerStatePayload(
+            supported_commands=self._get_supported_commands(),
+            volume=self.volume,
+            muted=self._muted,
+        )
+
+        for client in self._clients:
+            # Send group/update to all clients
+            client.send_message(group_message)
+
+            # Send server/state for metadata only to metadata clients
+            if client.check_role(Roles.METADATA):
+                metadata_update = (
+                    self._current_metadata.snapshot_update(
+                        int(self._server.loop.time() * 1_000_000)
+                    )
+                    if self._current_metadata is not None
+                    else None
+                )
+                # Use calculated track progress for actively playing content
+                if metadata_update is not None:
+                    metadata_update.track_progress = self._get_current_track_progress()
+                state_message = ServerStateMessage(ServerStatePayload(metadata=metadata_update))
+                client.send_message(state_message)
+
+            # Send server/state for controller only to controller clients
+            if client.check_role(Roles.CONTROLLER):
+                state_message = ServerStateMessage(ServerStatePayload(controller=controller_state))
+                client.send_message(state_message)
+
+    async def _send_controller_state_to_clients(self) -> None:
+        """Send server/state with controller payload to all controller clients."""
+        current_volume = self.volume
+        # Only send if rounded volume changed
+        if self._last_sent_volume is not None and self._last_sent_volume == current_volume:
+            return
+
+        self._last_sent_volume = current_volume
+        controller_state = ControllerStatePayload(
+            supported_commands=self._get_supported_commands(),
+            volume=current_volume,
+            muted=self._muted,
+        )
+        for client in self._clients:
+            if client.check_role(Roles.CONTROLLER):
+                state_message = ServerStateMessage(ServerStatePayload(controller=controller_state))
+                client.send_message(state_message)
+
+    async def _handle_reconfiguration_command(
+        self,
+        command: _StreamerReconfigureCommand,
+        streamer: Streamer,
+        media_stream: MediaStream,
+        active_channels: dict[UUID, AsyncGenerator[bytes, None]],
+        just_started_channels: set[UUID],
+    ) -> None:
+        """Handle a streamer reconfiguration command by updating topology and notifying clients."""
+        # Reconfigure with current player topology
+        start_payloads, new_sources = await streamer.configure(
+            command.all_player_configs, media_stream
+        )
+
+        # Add new channel sources to active channels
+        for channel_id, source in new_sources.items():
+            if channel_id not in active_channels:
+                active_channels[channel_id] = source
+                just_started_channels.add(channel_id)
+
+        # Drop channel sources that were removed by configure()
+        removed_channel_ids = set(active_channels) - streamer.get_channel_ids()
+        for removed_id in removed_channel_ids:
+            source = active_channels.pop(removed_id)
+            just_started_channels.discard(removed_id)
+            with suppress(Exception):
+                await source.aclose()
+
+        # Send stream/start messages to affected players
+        player_lookup = {player.client.client_id: player for player in self.players()}
+        for client_id, player_payload in start_payloads.items():
+            player_obj = player_lookup.get(client_id)
+            if player_obj is not None:
+                self._send_stream_start_msg(
+                    player_obj.client,
+                    player_stream_info=player_payload,
+                )
+        # Send group/update and server/state to all clients
+        # TODO: only send to clients that were affected by the change!
+        self._send_group_update_to_clients()
+        logger.debug("streamer reconfigured")
+
+    async def _prefill_channel_buffers(
+        self,
+        streamer: Streamer,
+        active_channels: dict[UUID, AsyncGenerator[bytes, None]],
+        just_started_channels: set[UUID],
+    ) -> None:
+        """Pre-fill buffers for channels that just started before beginning playback."""
+        channels_to_check = list(just_started_channels)
+        for channel_id in channels_to_check:
+            if channel_id not in active_channels:
+                just_started_channels.discard(channel_id)
+                continue
+            # Pre-fill this channel's buffer before starting playback
+            while streamer.channel_needs_data(channel_id):
+                source = active_channels[channel_id]
+                try:
+                    chunk = await asyncio.wait_for(anext(source), timeout=30.0)
+
+                    # Skip preparing chunks that are already in the past to avoid wasted work
+                    channel_state = streamer._channels.get(channel_id)  # noqa: SLF001
+                    if channel_state:
+                        # Calculate what this chunk's start timestamp would be
+                        sample_count = len(chunk) // channel_state.source_format_params.frame_stride
+                        start_samples = channel_state.samples_produced
+                        start_us = streamer._play_start_time_us + int(  # noqa: SLF001
+                            start_samples
+                            * 1_000_000
+                            / channel_state.source_format_params.audio_format.sample_rate
+                        )
+
+                        # Check if chunk is already outdated
+                        now_us = int(self._server.loop.time() * 1_000_000)
+
+                        if start_us < now_us:
+                            # Skip outdated chunk but update sample counter to maintain sync
+                            channel_state.samples_produced += sample_count
+                            logger.debug(
+                                "Skipping outdated chunk for channel %s (start: %d us, now: %d us)",
+                                channel_id,
+                                start_us,
+                                now_us,
+                            )
+                            continue
+
+                    streamer.prepare(channel_id, chunk, during_initial_buffering=True)
+                    continue  # Continue filling buffer
+                except StopAsyncIteration:
+                    pass  # Channel exhausted (normal completion)
+                except TimeoutError:
+                    logger.error("Channel %s timed out during prefill, removing", channel_id)
+                except Exception:
+                    logger.exception("Channel %s failed during prefill, removing", channel_id)
+                # Channel done (exhausted, timed out, or failed) - clean up and exit
+                del active_channels[channel_id]
+                with suppress(Exception):
+                    await source.aclose()
+                break
+            # Channel is now pre-filled, remove from just_started set
+            just_started_channels.discard(channel_id)
+
+    async def _read_pending_chunks(
+        self,
+        streamer: Streamer,
+        active_channels: dict[UUID, AsyncGenerator[bytes, None]],
+    ) -> bool:
+        """Read chunks from channels that need data until buffers are full.
+
+        Returns:
+            True if there are still active channels, False if all channels are exhausted.
+        """
+        any_channel_needs_data = True
+        while any_channel_needs_data and active_channels:
+            any_channel_needs_data = False
+            for channel_id in list(active_channels.keys()):
+                if not streamer.channel_needs_data(channel_id):
+                    continue
+                any_channel_needs_data = True
+                source = active_channels[channel_id]
+                try:
+                    chunk = await asyncio.wait_for(anext(source), timeout=30.0)
+                    streamer.prepare(channel_id, chunk)
+                    continue  # Done, continue with next channel
+                except StopAsyncIteration:
+                    pass  # Channel exhausted (normal completion)
+                except TimeoutError:
+                    logger.error("Channel %s timed out during read, removing", channel_id)
+                except Exception:
+                    logger.exception("Channel %s failed during read, removing", channel_id)
+                # Channel done (exhausted, timed out, or failed) - clean up
+                del active_channels[channel_id]
+                with suppress(Exception):
+                    await source.aclose()
+
+        return bool(active_channels)
+
+    async def _run_streamer(
         self,
         streamer: Streamer,
         media_stream: MediaStream,
+        active_channels: dict[UUID, AsyncGenerator[bytes, None]],
     ) -> int:
         """Consume media channels, distribute via streamer, and return end timestamp."""
         last_end_us = self._play_start_time_us or int(self._server.loop.time() * 1_000_000)
-        cancelled = False
-        just_started = True
+        just_started_channels: set[UUID] = set(active_channels.keys())
 
         try:
             while True:
                 # Check for commands before processing chunks
                 if self._stream_commands is not None and not self._stream_commands.empty():
-                    # We handle reconfiguration requests only between chunks so that
-                    # all clients only receive binary messages once the session was correctly
-                    # started or updated
                     command = self._stream_commands.get_nowait()
-                    start_payloads = streamer.configure(
-                        audio_format=command.audio_format,
-                        clients=command.client_configs,
+                    await self._handle_reconfiguration_command(
+                        command, streamer, media_stream, active_channels, just_started_channels
                     )
-                    # Send stream/start messages to affected players
-                    player_lookup = {player.client.client_id: player for player in self.players()}
-                    for client_id, player_payload in start_payloads.items():
-                        player_obj = player_lookup.get(client_id)
-                        if player_obj is not None:
-                            self._send_stream_start_msg(
-                                player_obj.client,
-                                player_stream_info=player_payload,
-                            )
-                    # Send session/update to all clients
-                    # TODO: only send to clients that were affected by the change!
-                    for client in self._clients:
-                        if client.check_role(Roles.METADATA):
-                            metadata_update = (
-                                self._current_metadata.snapshot_update(
-                                    int(self._server.loop.time() * 1_000_000)
-                                )
-                                if self._current_metadata is not None
-                                else None
-                            )
-                        else:
-                            metadata_update = None
-                        if client.check_role(Roles.CONTROLLER) or client.check_role(Roles.METADATA):
-                            playback_state = (
-                                PlaybackStateType.PLAYING
-                                if self._current_state == PlaybackStateType.PLAYING
-                                else PlaybackStateType.PAUSED
-                            )
-                        else:
-                            playback_state = None
-                        message = SessionUpdateMessage(
-                            SessionUpdatePayload(
-                                group_id=self._group_id,
-                                playback_state=playback_state,
-                                metadata=metadata_update,
-                            )
-                        )
-                        client.send_message(message)
                     continue
 
-                if just_started:
-                    try:
-                        while streamer.prepare(
-                            await anext(media_stream.source), during_initial_buffering=True
-                        ):
-                            # Pre-fill the initial buffer
-                            pass
-                    except StopAsyncIteration:
-                        # Source exhausted, exit loop
-                        break
-                    just_started = False
+                # Pre-fill buffers for channels that just started
+                if just_started_channels:
+                    await self._prefill_channel_buffers(
+                        streamer, active_channels, just_started_channels
+                    )
 
-                try:
-                    chunk = await anext(media_stream.source)
-                except StopAsyncIteration:
-                    # Source exhausted, exit loop
-                    break
+                # Read chunks from channels that need data until buffers are full
+                if not await self._read_pending_chunks(streamer, active_channels):
+                    break  # All channels exhausted
 
-                # Prepare the chunk
-                streamer.prepare(chunk)
-
-                # Send all prepared chunks
+                # Send prepared chunks after buffers are full
                 await streamer.send()
 
-            # We are done
-
+            # Normal completion - flush and send remaining chunks
             streamer.flush()
-            # Send all remaining chunks
             await streamer.send()
             if streamer.last_chunk_end_time_us is not None:
                 last_end_us = streamer.last_chunk_end_time_us
         except asyncio.CancelledError:
-            cancelled = True
+            # Cancellation - flush and send remaining chunks before cleanup
             streamer.flush()
-            # Send all remaining chunks
             await streamer.send()
             raise
         else:
             return last_end_us
         finally:
-            if cancelled and streamer.last_chunk_end_time_us is not None:
-                last_end_us = streamer.last_chunk_end_time_us
+            # Always close all remaining active channels to prevent resource leaks
+            for source in list(active_channels.values()):
+                with suppress(Exception):
+                    await source.aclose()
+            active_channels.clear()
 
     def _reconfigure_streamer(self) -> None:
         """Reconfigure the running streamer with current client topology."""
@@ -403,24 +563,24 @@ class ResonateGroup:
         ):
             raise RuntimeError("Streamer is not running")
 
-        client_configs: list[ClientStreamConfig] = []
-
+        # Build configs for all current players
+        all_player_configs: list[ClientStreamConfig] = []
         for player in self.players():
             assert player.support
-            client_id = player.client.client_id
-            target_format = self._player_formats[client_id]
-            client_configs.append(
+            target_format = player.determine_optimal_format(self._media_stream.main_channel[1])
+            all_player_configs.append(
                 ClientStreamConfig(
-                    client_id=client_id,
+                    client_id=player.client.client_id,
                     target_format=target_format,
                     buffer_capacity_bytes=player.support.buffer_capacity,
                     send=player.client.send_message,
                 )
             )
+
+        # Signal the streamer to reconfigure on next iteration with the new topology
         self._stream_commands.put_nowait(
             _StreamerReconfigureCommand(
-                audio_format=self._media_stream.audio_format,
-                client_configs=client_configs,
+                all_player_configs=all_player_configs,
             )
         )
 
@@ -442,7 +602,7 @@ class ResonateGroup:
             The recommended sample rate in Hz.
         """
         supported_sets: list[set[int]] = [
-            set(client.info.player_support.support_sample_rates)
+            {fmt.sample_rate for fmt in client.info.player_support.support_formats}
             for client in self._clients
             if client.check_role(Roles.PLAYER) and client.info.player_support
         ]
@@ -478,20 +638,32 @@ class ResonateGroup:
     ) -> None:
         """Send a stream start message to a client with the specified audio format for players."""
         assert client.check_role(Roles.PLAYER) == (player_stream_info is not None)
-        if client.check_role(Roles.METADATA) and client.info.metadata_support:
-            supported = client.info.metadata_support.support_picture_formats
-            art_format: PictureFormat | None = None
-            for fmt in (PictureFormat.JPEG, PictureFormat.PNG, PictureFormat.BMP):
-                if fmt.value in supported:
-                    art_format = fmt
-                    self._client_art_formats[client.client_id] = art_format
-                    break
-            if art_format is not None:
-                metadata_stream_info = StreamStartMetadata(art_format=art_format)
+        if client.check_role(Roles.ARTWORK) and client.info.artwork_support:
+            # Initialize artwork state for all channels
+            channels = client.info.artwork_support.channels
+            if channels:
+                stream_channels = []
+                client_channel_state = {}
+
+                for channel_num, channel in enumerate(channels):
+                    # Create stream channel config
+                    stream_channel = StreamArtworkChannelConfig(
+                        source=channel.source,
+                        format=channel.format,
+                        width=channel.media_width,
+                        height=channel.media_height,
+                    )
+                    stream_channels.append(stream_channel)
+
+                    # Store channel state (reuse ArtworkChannel)
+                    client_channel_state[channel_num] = channel
+
+                self._client_artwork_state[client.client_id] = client_channel_state
+                artwork_stream_info = StreamStartArtwork(channels=stream_channels)
             else:
-                metadata_stream_info = None
+                artwork_stream_info = None
         else:
-            metadata_stream_info = None
+            artwork_stream_info = None
 
         # TODO: finish once spec is finalized
         visualizer_stream_info = (
@@ -500,7 +672,7 @@ class ResonateGroup:
 
         stream_info = StreamStartPayload(
             player=player_stream_info,
-            metadata=metadata_stream_info,
+            artwork=artwork_stream_info,
             visualizer=visualizer_stream_info,
         )
         logger.debug(
@@ -513,11 +685,118 @@ class ResonateGroup:
     def _send_stream_end_msg(self, client: ResonateClient) -> None:
         """Send a stream end message to a client to stop playback."""
         logger.debug("ending stream for %s (%s)", client.name, client.client_id)
-        # Lifetime of album artwork is bound to the stream
-        self._client_art_formats.pop(client.client_id, None)
+        # Lifetime of artwork state is bound to the stream
+        self._client_artwork_state.pop(client.client_id, None)
         client.send_message(StreamEndMessage())
 
-    async def stop(self, stop_time_us: int | None = None) -> bool:  # noqa: PLR0915
+    def _schedule_delayed_stop(self, stop_time_us: int, active: bool, needs_cleanup: bool) -> bool:  # noqa: FBT001
+        """Schedule a delayed stop at the specified timestamp.
+
+        Args:
+            stop_time_us: Absolute timestamp when stop should occur
+            active: Whether stream task is currently active
+            needs_cleanup: Whether cleanup is needed
+
+        Returns:
+            True if stop was scheduled, False if nothing to do
+        """
+        now_us = int(self._server.loop.time() * 1_000_000)
+        if stop_time_us <= now_us:
+            return False
+
+        # Only schedule if there's something to stop or cleanup
+        if not active and not needs_cleanup:
+            return False
+
+        delay = (stop_time_us - now_us) / 1_000_000
+
+        async def _delayed_stop() -> None:
+            # Store handle locally to detect if it's been replaced
+            handle = self._scheduled_stop_handle
+            try:
+                await self.stop()  # This will clear _scheduled_stop_handle
+            except Exception:
+                logger.exception("Scheduled stop failed")
+            finally:
+                # Only clear if this handle is still current (e.g., stop() was interrupted
+                # or a new stop was scheduled during the stop() call)
+                if self._scheduled_stop_handle is handle:
+                    self._scheduled_stop_handle = None
+
+        def _schedule_stop() -> None:
+            task = self._server.loop.create_task(_delayed_stop())
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+
+        self._scheduled_stop_handle = self._server.loop.call_later(delay, _schedule_stop)
+        return True
+
+    async def _cancel_stream_task(self) -> None:
+        """Cancel the active stream task and wait for it to complete."""
+        if self._stream_task is None:
+            return
+
+        stream_task = self._stream_task
+        stream_task.cancel()
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Unhandled exception while stopping stream task")
+        self._stream_task = None
+
+    async def _cleanup_streaming_resources(self) -> None:
+        """Clean up all streaming-related resources."""
+        if self._streamer is not None:
+            self._streamer.reset()
+            self._streamer = None
+
+        if self._media_stream is not None:
+            with suppress(Exception):
+                await self._media_stream.main_channel[0].aclose()
+        self._media_stream = None
+        self._stream_commands = None
+
+        for client in self._clients:
+            self._send_stream_end_msg(client)
+
+        self._audio_encoders.clear()
+        self._current_media_art.clear()
+        self._play_start_time_us = None
+        self._track_progress_timestamp_us = None
+
+    def _send_stopped_state_to_clients(self) -> None:
+        """Send stopped state and cleared metadata to all clients."""
+        timestamp = int(self._server.loop.time() * 1_000_000)
+        cleared_metadata = Metadata.cleared_update(timestamp)
+        group_message = GroupUpdateServerMessage(
+            GroupUpdateServerPayload(
+                playback_state=PlaybackStateType.STOPPED,
+                group_id=self._group_id,
+                group_name=self._group_name,
+            )
+        )
+        controller_state = ControllerStatePayload(
+            supported_commands=self._get_supported_commands(),
+            volume=self.volume,
+            muted=self._muted,
+        )
+
+        for client in self._clients:
+            # Send group/update to all clients
+            client.send_message(group_message)
+
+            # Send server/state for cleared metadata only to metadata clients
+            if client.check_role(Roles.METADATA):
+                state_message = ServerStateMessage(ServerStatePayload(metadata=cleared_metadata))
+                client.send_message(state_message)
+
+            # Send server/state for controller only to controller clients
+            if client.check_role(Roles.CONTROLLER):
+                state_message = ServerStateMessage(ServerStatePayload(controller=controller_state))
+                client.send_message(state_message)
+
+    async def stop(self, stop_time_us: int | None = None) -> bool:
         """
         Stop playback for the group and clean up resources.
 
@@ -545,32 +824,11 @@ class ResonateGroup:
         active = self._stream_task is not None
         needs_cleanup = self._current_state != PlaybackStateType.STOPPED
 
-        if stop_time_us is not None:
-            now_us = int(self._server.loop.time() * 1_000_000)
-            if stop_time_us > now_us:
-                # Only schedule if there's something to stop or cleanup
-                if not active and not needs_cleanup:
-                    return False
-
-                delay = (stop_time_us - now_us) / 1_000_000
-
-                async def _delayed_stop() -> None:
-                    # Store handle locally to detect if it's been replaced
-                    handle = self._scheduled_stop_handle
-                    try:
-                        await self.stop()  # This will clear _scheduled_stop_handle
-                    except Exception:
-                        logger.exception("Scheduled stop failed")
-                    finally:
-                        # Only clear if this handle is still current (e.g., stop() was interrupted
-                        # or a new stop was scheduled during the stop() call)
-                        if self._scheduled_stop_handle is handle:
-                            self._scheduled_stop_handle = None
-
-                self._scheduled_stop_handle = self._server.loop.call_later(
-                    delay, lambda: self._server.loop.create_task(_delayed_stop())
-                )
-                return active or needs_cleanup
+        # Handle delayed stop if requested
+        if stop_time_us is not None and self._schedule_delayed_stop(
+            stop_time_us, active, needs_cleanup
+        ):
+            return active or needs_cleanup
 
         if not active and not needs_cleanup:
             return False
@@ -580,58 +838,53 @@ class ResonateGroup:
             [c.client_id for c in self._clients],
         )
 
-        if self._stream_task is not None:
-            stream_task = self._stream_task
-            stream_task.cancel()
-            try:
-                await stream_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Unhandled exception while stopping stream task")
-            self._stream_task = None
-
-        if self._streamer is not None:
-            self._streamer.reset()
-            self._streamer = None
-
-        if self._media_stream is not None:
-            with suppress(Exception):
-                await self._media_stream.source.aclose()
-        self._media_stream = None
-        self._stream_commands = None
-
-        for client in self._clients:
-            self._send_stream_end_msg(client)
-            if client.check_role(Roles.PLAYER):
-                self._player_formats.pop(client.client_id, None)
-
-        self._audio_encoders.clear()
-        self._current_media_art = None
-        self._play_start_time_us = None
+        try:
+            await self._cancel_stream_task()
+        finally:
+            await self._cleanup_streaming_resources()
 
         if self._current_state != PlaybackStateType.STOPPED:
             self._signal_event(GroupStateChangedEvent(PlaybackStateType.STOPPED))
             self._current_state = PlaybackStateType.STOPPED
 
-        timestamp = int(self._server.loop.time() * 1_000_000)
-        cleared_metadata = Metadata.cleared_update(timestamp)
-        for client in self._clients:
-            playback_state = (
-                PlaybackStateType.STOPPED
-                if (client.check_role(Roles.CONTROLLER) or client.check_role(Roles.METADATA))
-                else None
-            )
-            metadata_payload = cleared_metadata if client.check_role(Roles.METADATA) else None
-            message = SessionUpdateMessage(
-                SessionUpdatePayload(
-                    group_id=self._group_id,
-                    playback_state=playback_state,
-                    metadata=metadata_payload,
-                )
-            )
-            client.send_message(message)
+        self._send_stopped_state_to_clients()
         return True
+
+    def _get_current_track_progress(self) -> int | None:
+        """
+        Calculate the current track progress in milliseconds.
+
+        Returns the calculated progress based on playback time if actively playing,
+        otherwise returns the stored progress value.
+        """
+        if self._current_metadata is None or self._current_metadata.track_progress is None:
+            return None
+
+        # If we have a stored timestamp and we're actively playing, calculate current progress
+        if (
+            self._track_progress_timestamp_us is not None
+            and self.has_active_stream
+            and self._current_metadata.playback_speed is not None
+        ):
+            current_time_us = int(self._server.loop.time() * 1_000_000)
+            elapsed_us = current_time_us - self._track_progress_timestamp_us
+            # playback_speed is stored as int * 1000 (e.g., 1000 = normal speed)
+            # Convert elapsed microseconds to milliseconds, accounting for playback speed
+            elapsed_ms = (elapsed_us * self._current_metadata.playback_speed) // 1_000_000
+            calculated_progress = self._current_metadata.track_progress + elapsed_ms
+
+            # Clamp to valid range [0, track_duration]
+            if self._current_metadata.track_duration is not None:
+                calculated_progress = max(
+                    0, min(calculated_progress, self._current_metadata.track_duration)
+                )
+            else:
+                calculated_progress = max(0, calculated_progress)
+
+            return calculated_progress
+
+        # Otherwise return the stored value
+        return self._current_metadata.track_progress
 
     def set_metadata(self, metadata: Metadata | None, timestamp: int | None = None) -> None:
         """
@@ -659,41 +912,67 @@ class ResonateGroup:
             # Only include fields that have changed since the last metadata update
             metadata_update = metadata.diff_update(last_metadata, timestamp)
 
-        # Send the update to all clients in the group
-        message = SessionUpdateMessage(
-            SessionUpdatePayload(
+        # Send updates to all clients in the group
+        playback_state = (
+            PlaybackStateType.PLAYING
+            if self._current_state == PlaybackStateType.PLAYING
+            else PlaybackStateType.PAUSED
+        )
+        group_message = GroupUpdateServerMessage(
+            GroupUpdateServerPayload(
+                playback_state=playback_state,
                 group_id=self._group_id,
+                group_name=self._group_name,
             )
         )
+
         for client in self._clients:
-            if client.check_role(Roles.METADATA):
-                message.payload.metadata = metadata_update
-            else:
-                message.payload.metadata = None
-            if client.check_role(Roles.CONTROLLER) or client.check_role(Roles.METADATA):
-                message.payload.playback_state = (
-                    PlaybackStateType.PLAYING
-                    if self._current_state == PlaybackStateType.PLAYING
-                    else PlaybackStateType.PAUSED
-                )
-            else:
-                message.payload.playback_state = None
+            # Send group/update to all clients
             logger.debug(
-                "Sending session update to client %s",
+                "Sending group update to client %s",
                 client.client_id,
             )
-            client.send_message(message)
+            client.send_message(group_message)
+
+            # Send server/state for metadata only to metadata clients
+            if client.check_role(Roles.METADATA):
+                state_message = ServerStateMessage(ServerStatePayload(metadata=metadata_update))
+                logger.debug(
+                    "Sending server state to client %s",
+                    client.client_id,
+                )
+                client.send_message(state_message)
 
         # Update current metadata
         self._current_metadata = metadata
 
-    def set_media_art(self, image: Image.Image) -> None:
-        """Set the artwork image for the current media."""
-        # Store the current media art for new clients that join later
-        self._current_media_art = image
+        # Store timestamp when track_progress is updated for progress calculation
+        if metadata is not None and metadata.track_progress is not None:
+            self._track_progress_timestamp_us = timestamp
+
+    def set_media_art(
+        self, image: Image.Image | None, source: ArtworkSource = ArtworkSource.ALBUM
+    ) -> None:
+        """Set or clear artwork image for the current media.
+
+        Args:
+            image: The artwork image to set, or None to clear artwork for this source
+            source: Source type (ALBUM or ARTIST), NONE is not allowed
+        """
+        if source == ArtworkSource.NONE:
+            raise ValueError("Cannot set artwork with source NONE")
+
+        if image is None:
+            self._current_media_art.pop(source, None)
+        else:
+            self._current_media_art[source] = image
 
         for client in self._clients:
-            self._send_media_art_to_client(client, image)
+            client_state = self._client_artwork_state.get(client.client_id)
+            if client_state:
+                for channel_num, channel_config in client_state.items():
+                    if channel_config.source == source:
+                        self._send_media_art_to_client(client, image, channel_num)
 
     def _letterbox_image(
         self, image: Image.Image, target_width: int, target_height: int
@@ -739,63 +1018,137 @@ class ResonateGroup:
 
         return letterboxed
 
-    def _send_media_art_to_client(self, client: ResonateClient, image: Image.Image) -> None:
-        """Send media art to a specific client with appropriate format and sizing."""
-        if not client.check_role(Roles.METADATA) or not client.info.metadata_support:
+    def _send_media_art_to_client(
+        self, client: ResonateClient, image: Image.Image | None, channel: int
+    ) -> None:
+        """Send or clear media art to a specific client channel.
+
+        Args:
+            client: Client to send to
+            image: Image to send, or None to clear artwork on this channel
+            channel: Channel number (0-3)
+        """
+        if not client.check_role(Roles.ARTWORK):
             return
 
-        art_format = self._client_art_formats.get(client.client_id)
-        if art_format is None:
-            # Do nothing if we are not in an active session or this client doesn't support artwork
-            return
-        metadata_support = client.info.metadata_support
-        width = metadata_support.media_width
-        height = metadata_support.media_height
-
-        if width is None and height is None:
-            # No size constraints, use original image size
-            resized_image = image
-        elif width is not None and height is None:
-            # Only width constraint, scale height to maintain aspect ratio
-            aspect_ratio = image.height / image.width
-            height = int(width * aspect_ratio)
-            resized_image = image.resize((width, height), Image.Resampling.LANCZOS)
-        elif width is None and height is not None:
-            # Only height constraint, scale width to maintain aspect ratio
-            aspect_ratio = image.width / image.height
-            width = int(height * aspect_ratio)
-            resized_image = image.resize((width, height), Image.Resampling.LANCZOS)
-        else:
-            # Both width and height constraints - use letterboxing to preserve aspect ratio
-            resized_image = self._letterbox_image(image, cast("int", width), cast("int", height))
-
-        with BytesIO() as img_bytes:
-            if art_format == PictureFormat.JPEG:
-                resized_image.save(img_bytes, format="JPEG", quality=85)
-            elif art_format == PictureFormat.PNG:
-                resized_image.save(img_bytes, format="PNG", compress_level=6)
-            elif art_format == PictureFormat.BMP:
-                resized_image.save(img_bytes, format="BMP")
-            else:
-                raise NotImplementedError(f"Unsupported artwork format: {art_format}")
-            img_bytes.seek(0)
-            img_data = img_bytes.read()
-            header = pack_binary_header_raw(
-                BinaryMessageType.MEDIA_ART.value, int(self._server.loop.time() * 1_000_000)
+        client_state = self._client_artwork_state.get(client.client_id)
+        if client_state is None:
+            logger.warning(
+                "Cannot send artwork to client %s channel %d: no active stream",
+                client.client_id,
+                channel,
             )
-            client.send_message(header + img_data)
+            return
+        if channel not in client_state:
+            logger.warning(
+                "Cannot send artwork to client %s channel %d: channel not configured",
+                client.client_id,
+                channel,
+            )
+            return
+
+        message_type = BinaryMessageType.ARTWORK_CHANNEL_0.value + channel
+        header = pack_binary_header_raw(message_type, int(self._server.loop.time() * 1_000_000))
+
+        if image is None:
+            client.send_message(header)
+        else:
+            channel_state = client_state[channel]
+            resized_image = self._letterbox_image(
+                image, channel_state.media_width, channel_state.media_height
+            )
+
+            with BytesIO() as img_bytes:
+                if channel_state.format == PictureFormat.JPEG:
+                    resized_image.save(img_bytes, format="JPEG", quality=85)
+                elif channel_state.format == PictureFormat.PNG:
+                    resized_image.save(img_bytes, format="PNG", compress_level=6)
+                elif channel_state.format == PictureFormat.BMP:
+                    resized_image.save(img_bytes, format="BMP")
+                else:
+                    raise NotImplementedError(f"Unsupported artwork format: {channel_state.format}")
+                img_bytes.seek(0)
+                img_data = img_bytes.read()
+                client.send_message(header + img_data)
 
     @property
     def clients(self) -> list[ResonateClient]:
         """All clients that are part of this group."""
         return self._clients
 
+    @property
+    def has_active_stream(self) -> bool:
+        """Check if there is an active stream running."""
+        return self._stream_task is not None
+
     def players(self) -> list[PlayerClient]:
         """Return player helpers for all members that support the role."""
         return [client.player for client in self._clients if client.player is not None]
 
-    def _handle_group_command(self, cmd: GroupCommandClientPayload) -> None:
-        # TODO: verify that this command is actually supported for the current state
+    def _get_supported_commands(self) -> list[MediaCommand]:
+        """Get list of commands supported in the current state."""
+        # TODO: ask library user instead what is supported and what not
+        # also, what if volume/mute/switch is not supported?
+        # Always available
+        commands: list[MediaCommand] = [
+            MediaCommand.VOLUME,
+            MediaCommand.MUTE,
+            MediaCommand.SWITCH,
+        ]
+
+        # State-dependent commands
+        if self._current_state == PlaybackStateType.PLAYING:
+            commands.extend(
+                [
+                    MediaCommand.PAUSE,
+                    MediaCommand.STOP,
+                    MediaCommand.NEXT,
+                    MediaCommand.PREVIOUS,
+                    MediaCommand.REPEAT_OFF,
+                    MediaCommand.REPEAT_ONE,
+                    MediaCommand.REPEAT_ALL,
+                    MediaCommand.SHUFFLE,
+                    MediaCommand.UNSHUFFLE,
+                ]
+            )
+        elif self._current_state == PlaybackStateType.PAUSED:
+            commands.extend(
+                [
+                    MediaCommand.PLAY,
+                    MediaCommand.STOP,
+                    MediaCommand.NEXT,
+                    MediaCommand.PREVIOUS,
+                    MediaCommand.REPEAT_OFF,
+                    MediaCommand.REPEAT_ONE,
+                    MediaCommand.REPEAT_ALL,
+                    MediaCommand.SHUFFLE,
+                    MediaCommand.UNSHUFFLE,
+                ]
+            )
+        elif self._current_state == PlaybackStateType.STOPPED:
+            commands.append(MediaCommand.PLAY)
+
+        return commands
+
+    async def _handle_group_command(self, cmd: ControllerCommandPayload) -> None:
+        # Verify that this command is actually supported for the current state
+        supported = self._get_supported_commands()
+        if cmd.command not in supported:
+            logger.warning(
+                "Ignoring unsupported command %s in state %s (supported: %s)",
+                cmd.command,
+                self._current_state,
+                supported,
+            )
+            return
+
+        # Handle volume and mute commands directly
+        if cmd.command == MediaCommand.VOLUME and cmd.volume is not None:
+            await self.set_volume(cmd.volume)
+        elif cmd.command == MediaCommand.MUTE and cmd.mute is not None:
+            await self.set_mute(cmd.mute)
+
+        # Signal the event for other commands
         event = GroupCommandEvent(
             command=cmd.command,
             volume=cmd.volume,
@@ -820,12 +1173,60 @@ class ResonateGroup:
 
     def _signal_event(self, event: GroupEvent) -> None:
         for cb in self._event_cbs:
-            self._server.loop.create_task(cb(event))
+            task = self._server.loop.create_task(cb(event))
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
     @property
     def state(self) -> PlaybackStateType:
         """Current playback state of the group."""
         return self._current_state
+
+    @property
+    def volume(self) -> int:
+        """Current group volume (0-100), calculated as average of player volumes."""
+        players = self.players()
+        if not players:
+            return 100
+        # Calculate average volume from all players
+        total_volume = sum(player.volume for player in players)
+        return round(total_volume / len(players))
+
+    @property
+    def muted(self) -> bool:
+        """Current group mute state."""
+        return self._muted
+
+    async def set_volume(self, volume_level: int) -> None:
+        """
+        Set group volume by applying the difference to all players.
+
+        Similar to how Music Assistant handles group volume - calculates the
+        difference from current group volume and applies it to each player.
+        """
+        volume_level = max(0, min(100, volume_level))
+        cur_volume = self.volume
+        volume_dif = volume_level - cur_volume
+
+        # Apply volume difference to all players
+        for player in self.players():
+            cur_player_volume = player.volume
+            new_player_volume = max(0, min(100, cur_player_volume + volume_dif))
+            player.set_volume(new_player_volume)
+
+        # Send state update to controller clients if rounded volume changed
+        await self._send_controller_state_to_clients()
+
+    async def set_mute(self, muted: bool) -> None:  # noqa: FBT001
+        """Set group mute state and propagate to all players."""
+        self._muted = muted
+        # Propagate to all player clients
+        for player in self.players():
+            if muted:
+                player.mute()
+            else:
+                player.unmute()
+        # Send state update to controller clients
+        await self._send_controller_state_to_clients()
 
     async def remove_client(self, client: ResonateClient) -> None:
         """
@@ -848,8 +1249,6 @@ class ResonateGroup:
             self._clients = []
         else:
             self._clients.remove(client)
-            if client.check_role(Roles.PLAYER):
-                self._player_formats.pop(client.client_id, None)
             self._send_stream_end_msg(client)
 
             # Reconfigure streamer if actively streaming
@@ -897,49 +1296,140 @@ class ResonateGroup:
         if self._stream_task is not None and self._media_stream:
             logger.debug("Joining client %s to current stream", client.client_id)
             if client.check_role(Roles.PLAYER):
-                player_format = client.require_player.determine_optimal_format(
-                    self._media_stream.audio_format
-                )
-                self._player_formats[client.client_id] = player_format
                 self._reconfigure_streamer()
-            elif client.check_role(Roles.METADATA) or client.check_role(Roles.VISUALIZER):
+            elif (
+                client.check_role(Roles.METADATA)
+                or client.check_role(Roles.VISUALIZER)
+                or client.check_role(Roles.ARTWORK)
+            ):
                 self._send_stream_start_msg(client, None)
 
-        # Send current metadata to the new player if available
-        if self._current_metadata is not None:
-            if client.check_role(Roles.METADATA):
-                metadata_update = self._current_metadata.snapshot_update(
-                    int(self._server.loop.time() * 1_000_000)
-                )
-            else:
-                metadata_update = None
-            if client.check_role(Roles.CONTROLLER) or client.check_role(Roles.METADATA):
-                playback_state = (
-                    PlaybackStateType.PLAYING
-                    if self._current_state == PlaybackStateType.PLAYING
-                    else PlaybackStateType.PAUSED
-                )
-            else:
-                playback_state = None
-            message = SessionUpdateMessage(
-                SessionUpdatePayload(
-                    group_id=self._group_id,
-                    playback_state=playback_state,
-                    metadata=metadata_update,
-                )
+        # Send current state to the new client
+        playback_state = (
+            PlaybackStateType.PLAYING
+            if self._current_state == PlaybackStateType.PLAYING
+            else PlaybackStateType.PAUSED
+        )
+        group_message = GroupUpdateServerMessage(
+            GroupUpdateServerPayload(
+                playback_state=playback_state,
+                group_id=self._group_id,
+                group_name=self._group_name,
             )
+        )
+        logger.debug("Sending group update to new client %s", client.client_id)
+        client.send_message(group_message)
 
-            logger.debug("Sending session update to new client %s", client.client_id)
-            client.send_message(message)
+        # Send server/state for metadata only to metadata clients
+        if self._current_metadata is not None and client.check_role(Roles.METADATA):
+            metadata_update = self._current_metadata.snapshot_update(
+                int(self._server.loop.time() * 1_000_000)
+            )
+            # Use calculated track progress for actively playing content
+            metadata_update.track_progress = self._get_current_track_progress()
+            state_message = ServerStateMessage(ServerStatePayload(metadata=metadata_update))
+            logger.debug("Sending server state to new client %s", client.client_id)
+            client.send_message(state_message)
+
+        # Send server/state for controller only to controller clients
+        if client.check_role(Roles.CONTROLLER):
+            controller_state = ControllerStatePayload(
+                supported_commands=self._get_supported_commands(),
+                volume=self.volume,
+                muted=self._muted,
+            )
+            state_message = ServerStateMessage(ServerStatePayload(controller=controller_state))
+            logger.debug("Sending controller state to new client %s", client.client_id)
+            client.send_message(state_message)
 
         # Send current media art to the new client if available
-        if self._current_media_art is not None:
-            self._send_media_art_to_client(client, self._current_media_art)
+        client_state = self._client_artwork_state.get(client.client_id)
+        if client_state:
+            for channel_num, channel_config in client_state.items():
+                if channel_config.source == ArtworkSource.NONE:
+                    continue
+                artwork = self._current_media_art.get(channel_config.source)
+                if artwork:
+                    self._send_media_art_to_client(client, artwork, channel_num)
 
     def handle_stream_format_request(
         self,
-        player: ResonateClient,
+        client: ResonateClient,
         request: StreamRequestFormatPayload,
     ) -> None:
-        """Handle stream/request-format from a player and send stream/update."""
-        raise NotImplementedError("Dynamic format changes are not yet implemented")
+        """Handle stream/request-format from a client and send stream/update."""
+        if request.artwork:
+            if not client.check_role(Roles.ARTWORK):
+                raise ValueError(
+                    f"Client {client.client_id} sent artwork format request "
+                    "but does not have artwork role"
+                )
+
+            artwork_request = request.artwork
+
+            if not client.info.artwork_support:
+                raise ValueError(
+                    f"Client {client.client_id} sent artwork format request "
+                    "but has no artwork support"
+                )
+
+            client_state = self._client_artwork_state.get(client.client_id)
+            if client_state is None:
+                return
+
+            if artwork_request.channel not in client_state:
+                raise ValueError(
+                    f"Invalid channel {artwork_request.channel} from client {client.client_id} "
+                    f"(client declared {len(client.info.artwork_support.channels)} channels)"
+                )
+
+            current_channel = client_state[artwork_request.channel]
+
+            updated_channel = ArtworkChannel(
+                source=artwork_request.source
+                if artwork_request.source is not None
+                else current_channel.source,
+                format=artwork_request.format
+                if artwork_request.format is not None
+                else current_channel.format,
+                media_width=artwork_request.media_width
+                if artwork_request.media_width is not None
+                else current_channel.media_width,
+                media_height=artwork_request.media_height
+                if artwork_request.media_height is not None
+                else current_channel.media_height,
+            )
+
+            client_state[artwork_request.channel] = updated_channel
+
+            updates = [StreamArtworkChannelConfigUpdate()] * len(client_state)
+            updates[artwork_request.channel] = StreamArtworkChannelConfigUpdate(
+                source=artwork_request.source,
+                format=artwork_request.format,
+                width=artwork_request.media_width,
+                height=artwork_request.media_height,
+            )
+
+            stream_update = StreamUpdatePayload(
+                artwork=StreamUpdateArtwork(channels=updates),
+            )
+
+            logger.debug(
+                "Sending stream/update to client %s for artwork channel %d",
+                client.client_id,
+                artwork_request.channel,
+            )
+            client.send_message(StreamUpdateMessage(stream_update))
+
+            if updated_channel.source != ArtworkSource.NONE:
+                artwork = self._current_media_art.get(updated_channel.source)
+                if artwork:
+                    self._send_media_art_to_client(client, artwork, artwork_request.channel)
+
+        if request.player:
+            if not client.check_role(Roles.PLAYER):
+                raise ValueError(
+                    f"Client {client.client_id} sent player format request "
+                    "but does not have player role"
+                )
+            raise NotImplementedError("Player format changes are not yet implemented")
